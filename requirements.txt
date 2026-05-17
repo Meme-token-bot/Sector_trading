@@ -1,0 +1,12 @@
+streamlit>=1.36
+pandas>=2.2
+numpy>=1.26
+yfinance>=0.2.40
+openai>=1.40
+pydantic>=2.7
+python-dotenv>=1.0
+tigeropen>=3.1.0
+pandas-datareader>=0.10
+plotly>=5.22
+trafilatura>=1.12
+pypdf>=4.3
