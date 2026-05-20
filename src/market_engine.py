@@ -115,3 +115,97 @@ def yield_curve_spread() -> dict:
 
 def fetch_macro_prices() -> pd.DataFrame:
     return fetch_prices(list(MACRO_TICKERS.values()), lookback_days=400)
+
+
+def fetch_ohlcv_yf(tickers: list[str], timeframe: str,
+                   start: date, end: date | None = None) -> pd.DataFrame:
+    """Pull OHLCV via yfinance and normalize to flat row format.
+
+    Returns a DataFrame with columns:
+        ticker, bar_date, open, high, low, close, volume
+
+    `timeframe` maps directly onto yfinance's `interval` argument ('1d' or
+    '1wk'). For weekly bars yfinance returns the week-START Monday as the
+    index; we normalize to the trading-week's end (Friday) so the stored
+    `bar_date` is the *as-of* date of the bar rather than its opening day.
+
+    Uses `auto_adjust=True` and `group_by='ticker'` so the returned shape is
+    predictable across the single-vs-multi-ticker boundary. yfinance returns
+    flat columns when one ticker is passed and a MultiIndex when many are;
+    both shapes are normalized here. Rows with all-NaN OHLC are dropped.
+    """
+    if not tickers:
+        return pd.DataFrame(columns=["ticker", "bar_date", "open",
+                                     "high", "low", "close", "volume"])
+    if timeframe not in ("1d", "1wk"):
+        raise ValueError(f"unsupported timeframe: {timeframe!r}")
+
+    end_date = end or date.today()
+    raw = yf.download(
+        tickers,
+        start=start,
+        end=end_date + timedelta(days=1),
+        interval=timeframe,
+        auto_adjust=True,
+        group_by="ticker",
+        progress=False,
+        threads=False,
+    )
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["ticker", "bar_date", "open",
+                                     "high", "low", "close", "volume"])
+
+    frames: list[pd.DataFrame] = []
+    if isinstance(raw.columns, pd.MultiIndex):
+        # group_by='ticker' => level 0 = ticker, level 1 = field.
+        # Some yfinance versions flip the order; detect by inspecting level 0.
+        lvl0 = set(raw.columns.get_level_values(0))
+        ticker_first = bool(lvl0 & set(tickers))
+        for tkr in tickers:
+            try:
+                sub = raw[tkr] if ticker_first else raw.xs(tkr, axis=1, level=1)
+            except KeyError:
+                continue
+            frames.append(_normalize_single_ohlcv(sub, tkr))
+    else:
+        # Single-ticker flat columns.
+        frames.append(_normalize_single_ohlcv(raw, tickers[0]))
+
+    if not frames:
+        return pd.DataFrame(columns=["ticker", "bar_date", "open",
+                                     "high", "low", "close", "volume"])
+
+    out = pd.concat(frames, ignore_index=True)
+    if timeframe == "1wk":
+        # yfinance puts the week start in the index — shift to Friday so the
+        # stored bar_date represents the week-ending session.
+        out["bar_date"] = out["bar_date"] + pd.Timedelta(days=4)
+    return out
+
+
+def _normalize_single_ohlcv(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Turn a single-ticker yfinance frame into the flat row format."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ticker", "bar_date", "open",
+                                     "high", "low", "close", "volume"])
+    cols = {c.lower(): c for c in df.columns}
+    needed = ["open", "high", "low", "close", "volume"]
+    if not all(k in cols for k in needed):
+        return pd.DataFrame(columns=["ticker", "bar_date", "open",
+                                     "high", "low", "close", "volume"])
+    sub = df[[cols[k] for k in needed]].copy()
+    sub.columns = needed
+    sub = sub.dropna(subset=["open", "high", "low", "close"], how="all")
+    if sub.empty:
+        return pd.DataFrame(columns=["ticker", "bar_date", "open",
+                                     "high", "low", "close", "volume"])
+    sub = sub.reset_index().rename(columns={sub.index.name or "index": "bar_date",
+                                            "Date": "bar_date",
+                                            "Datetime": "bar_date"})
+    # Ensure bar_date column exists after reset_index regardless of original index name.
+    if "bar_date" not in sub.columns:
+        first_col = sub.columns[0]
+        sub = sub.rename(columns={first_col: "bar_date"})
+    sub["bar_date"] = pd.to_datetime(sub["bar_date"]).dt.tz_localize(None).dt.normalize()
+    sub.insert(0, "ticker", ticker)
+    return sub[["ticker", "bar_date", "open", "high", "low", "close", "volume"]]

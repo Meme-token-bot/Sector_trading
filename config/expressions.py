@@ -36,6 +36,8 @@ EXPRESSIONS: dict[str, list[Expression]] = {
         Expression("XLY",  "S&P Discretionary (plain)",    "plain", 1.00),
         Expression("XHB",  "SPDR Homebuilders",            "operating_leverage", 1.4,
                    "Homebuilder margins lever to rate cuts."),
+        Expression("ITB",  "iShares Home Construction",    "operating_leverage", 1.5,
+                   "Pure-play builders; tighter rate sensitivity than XHB."),
         Expression("XRT",  "SPDR Retail (equal-weight)",   "thematic", 1.2),
     ],
     "XLC": [
@@ -54,9 +56,14 @@ EXPRESSIONS: dict[str, list[Expression]] = {
         Expression("ITA",  "iShares US Aerospace & Defense", "thematic", 1.1),
         Expression("XAR",  "SPDR Aerospace & Defense (EW)", "thematic", 1.2),
         Expression("PAVE", "Global X Infrastructure",      "thematic", 1.1),
+        Expression("IYT",  "iShares Transportation",       "operating_leverage", 1.3,
+                   "Rails/truckers/airfreight — cyclical leading indicator."),
+        Expression("XTN",  "SPDR Transportation (EW)",     "operating_leverage", 1.4),
     ],
     "XLB": [
         Expression("XLB",  "S&P Materials (plain)",        "plain", 1.00),
+        Expression("XME",  "SPDR Metals & Mining (EW)",    "operating_leverage", 1.7,
+                   "Equal-weight steel/coal/diversified miners; cyclical torque."),
         Expression("GDX",  "VanEck Gold Miners",           "operating_leverage", 2.0,
                    "Miner earnings lever to gold price via fixed AISC."),
         Expression("GDXJ", "VanEck Junior Gold Miners",    "operating_leverage", 2.5,

@@ -1,7 +1,7 @@
 """Streamlit dashboard — entrypoint."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -10,12 +10,14 @@ from config.settings import (
     BENCHMARK, GMAIL_ADDRESS, GMAIL_FILTER_ADDRESS, PARAMS,
     SECTOR_ETFS, gmail_configured, tiger_configured,
 )
+from src.charts import STATE_COLORS as _STATE_COLORS, build_etf_chart, build_mini_chart, compute_chart_overlays
 from src.db import aggregate_sentiment, delete_newsletter, init_db, recent_newsletters
 from src.market_engine import (
     compute_sector_metrics, fetch_macro_prices, fetch_prices,
     gold_oil_ratio, yield_curve_spread,
 )
 from src.nlp_pipeline import fetch_and_ingest, ingest
+from src.price_store import load_ohlcv, load_ohlcv_multi, update_all
 from src.signal_history import build_signal_history
 from src.signals import build_signals, refine_signals, target_weights
 from src.trend import build_sentiment_trend
@@ -28,6 +30,14 @@ st.set_page_config(
 )
 
 init_db()
+
+
+def _full_price_universe() -> list[str]:
+    """Tickers seeded into the OHLCV cache: signals + benchmark + all
+    expression tickers, deduped while preserving signal-first order."""
+    from config.expressions import all_expression_tickers
+    return list(dict.fromkeys([*SECTOR_ETFS, BENCHMARK, *all_expression_tickers()]))
+
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _cached_prices() -> pd.DataFrame:
@@ -61,15 +71,6 @@ def _cached_tiger_snapshot():
     return fetch_account_snapshot()
 
 
-_STATE_COLORS = {
-    "NEW_BUY":      "#143d2a",  # green — fresh entry OK
-    "HOLD_IF_LONG": "#3d3a14",  # amber — hold if owned, don't add
-    "CHASE":        "#4a3214",  # orange — too late, don't enter
-    "REDUCE":       "#3d1f14",  # rust — was BUY, now degraded
-    "HOLD":         "",         # neutral — wait
-    "SELL":         "#4a1818",  # red — exit
-}
-
 def _signal_row_style(row: pd.Series) -> list[str]:
     state = row.get("State", row.get("state", row.get("Signal", row.get("signal", ""))))
     color = _STATE_COLORS.get(state, "")
@@ -87,8 +88,8 @@ st.caption(
     f"SELL <= {PARAMS.sell_sentiment_threshold:+.0f}"
 )
 
-tab_dashboard, tab_expressions, tab_trend, tab_inbox, tab_ingest, tab_history = st.tabs(
-    ["📈 Dashboard", "🎯 Expressions", "✨ Trend", "📧 Inbox",
+tab_dashboard, tab_price, tab_expressions, tab_trend, tab_inbox, tab_ingest, tab_history = st.tabs(
+    ["📈 Dashboard", "📉 Price Action", "🎯 Expressions", "✨ Trend", "📧 Inbox",
      "📥 Ingest Newsletter", "🗂 History"]
 )
 
@@ -265,6 +266,226 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
         st.rerun()
 
 
+# ---------------------------------------------------------------------------
+# Price Action tab
+# ---------------------------------------------------------------------------
+
+_LOOKBACK_DAYS = {"3M": 92, "6M": 183, "1Y": 365, "2Y": 730, "5Y": 1825}
+
+# Warmup buffer prepended to whatever the user asked for. SMA200 needs ~200
+# bars before it produces a non-NaN value, so we load extra history and clip
+# back to the requested window inside `build_etf_chart` via `visible_start`.
+# Daily: ~300 calendar days covers 200 trading days with slack. Weekly: 300
+# weeks ≈ 2100 calendar days covers 200 weekly bars with slack. The prices DB
+# holds ~5y so this is always available; SQL clamps at the earliest stored bar.
+_WARMUP_DAYS_BY_TF = {"1d": 300, "1wk": 300 * 7}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_ohlcv(ticker: str, timeframe: str, start_iso: str) -> pd.DataFrame:
+    return load_ohlcv(ticker, timeframe, start=date.fromisoformat(start_iso))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_ohlcv_multi(tickers: tuple[str, ...], timeframe: str,
+                        start_iso: str) -> pd.DataFrame:
+    return load_ohlcv_multi(list(tickers), timeframe,
+                            start=date.fromisoformat(start_iso))
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_sector_sparklines(sector: str, as_of_iso: str) -> dict[str, list[float]]:
+    """Last 60 daily closes for each expression ticker in `sector`.
+
+    Loads ~90 calendar days from the prices DB (≈ 60 trading days) and returns
+    a dict {ticker: list[float]} suitable for `st.column_config.LineChartColumn`.
+    Tickers with no stored data map to an empty list.
+    """
+    from config.expressions import EXPRESSIONS
+    tickers = [e.ticker for e in EXPRESSIONS.get(sector, [])]
+    if not tickers:
+        return {}
+    spark_start = date.fromisoformat(as_of_iso) - timedelta(days=90)
+    frame = load_ohlcv_multi(tickers, "1d", start=spark_start)
+    top_level = (set(frame.columns.get_level_values(0))
+                 if not frame.empty else set())
+    out: dict[str, list[float]] = {}
+    for tkr in tickers:
+        if tkr in top_level:
+            try:
+                series = frame[tkr]["close"].dropna().tail(60)
+                out[tkr] = [float(v) for v in series.tolist()]
+            except KeyError:
+                out[tkr] = []
+        else:
+            out[tkr] = []
+    return out
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_signals_bundle(as_of_iso: str) -> pd.DataFrame:
+    """Re-compute the same signals bundle the Dashboard tab uses. Cached so
+    repeated Price Action reruns (toggling indicators, switching tickers) don't
+    re-run the metrics + signals pipeline each time."""
+    prices = _cached_prices()
+    metrics = compute_sector_metrics(prices)
+    sentiment = _cached_sentiment(as_of_iso)
+    raw_signals = build_signals(metrics, sentiment)
+    history = _cached_signal_history(as_of_iso)
+    return refine_signals(raw_signals, history)
+
+
+with tab_price:
+    st.subheader("Price Action")
+    st.caption(
+        "Candles, SMA50/200, optional RSI/MACD/Bollinger. Data is served from "
+        "the local prices DB (5y of 1d + 1wk). Use **Update price data** to "
+        "incrementally pull the latest bars from yfinance."
+    )
+
+    signals = _cached_signals_bundle(date.today().isoformat())
+
+    all_tickers = list(SECTOR_ETFS.keys()) + [BENCHMARK]
+
+    # ---- session-state defaults (one-time init) ----
+    if "pa_sector" not in st.session_state:
+        # Default = freshest NEW_BUY in the signals frame; fallback XLK.
+        new_buys = signals.index[signals["state"] == "NEW_BUY"].tolist()
+        st.session_state.pa_sector = new_buys[0] if new_buys else "XLK"
+    if "pa_timeframe" not in st.session_state:
+        st.session_state.pa_timeframe = "Daily"
+    if "pa_lookback" not in st.session_state:
+        st.session_state.pa_lookback = "1Y"
+    if "pa_compare_spy" not in st.session_state:
+        st.session_state.pa_compare_spy = False
+    if "pa_show_rsi" not in st.session_state:
+        st.session_state.pa_show_rsi = False
+    if "pa_show_macd" not in st.session_state:
+        st.session_state.pa_show_macd = False
+    if "pa_show_bb" not in st.session_state:
+        st.session_state.pa_show_bb = False
+
+    # ---- toolbar ----
+    tb1, tb2, tb3, tb4 = st.columns([1.3, 1, 1.2, 1.2])
+    with tb1:
+        st.selectbox(
+            "Sector", all_tickers, key="pa_sector",
+            format_func=lambda t: f"{t} — {SECTOR_ETFS.get(t, 'Benchmark')}",
+        )
+    with tb2:
+        st.radio("Timeframe", ["Daily", "Weekly"], key="pa_timeframe",
+                 horizontal=True)
+    with tb3:
+        st.radio("Lookback", list(_LOOKBACK_DAYS.keys()), key="pa_lookback",
+                 horizontal=True)
+    with tb4:
+        st.checkbox("Compare to SPY", key="pa_compare_spy")
+        if st.button("🔄 Update price data", key="pa_update_btn"):
+            prog_bar = st.progress(0.0)
+            prog_caption = st.empty()
+            # Update the full price universe (signals + expressions) so the
+            # Expressions tab has data too — not just the signal sectors.
+            tickers_to_update = _full_price_universe()
+            total_steps = len(tickers_to_update) * 2  # 1d + 1wk
+            done = {"n": 0}
+
+            def _progress(tkr: str, tf: str, status: str) -> None:
+                done["n"] += 1
+                prog_bar.progress(done["n"] / total_steps)
+                prog_caption.caption(f"{tkr} ({tf}): {status}")
+
+            with st.spinner("Updating from yfinance…"):
+                try:
+                    update_all(tickers=tickers_to_update, progress=_progress)
+                except Exception as e:
+                    st.error(f"Update failed: {e}")
+                else:
+                    # Targeted invalidation — don't nuke Dashboard caches.
+                    _cached_ohlcv.clear()
+                    _cached_ohlcv_multi.clear()
+                    st.success("Price data refreshed.")
+                    st.rerun()
+
+    # Indicator checkboxes
+    ic1, ic2, ic3 = st.columns(3)
+    ic1.checkbox("RSI(14)", key="pa_show_rsi")
+    ic2.checkbox("MACD(12,26,9)", key="pa_show_macd")
+    ic3.checkbox("Bollinger Bands (20, 2σ)", key="pa_show_bb")
+
+    # ---- main chart ----
+    ticker = st.session_state.pa_sector
+    timeframe = "1d" if st.session_state.pa_timeframe == "Daily" else "1wk"
+    lookback_days = _LOOKBACK_DAYS[st.session_state.pa_lookback]
+    start = date.today() - timedelta(days=lookback_days)
+
+    # Load with extra warmup so SMA200 is populated across the visible window.
+    # `build_etf_chart` clips back to `visible_start` for display.
+    warmup_days = _WARMUP_DAYS_BY_TF[timeframe]
+    fetch_start = start - timedelta(days=warmup_days)
+    visible_start = pd.Timestamp(start)
+
+    ohlcv = _cached_ohlcv(ticker, timeframe, fetch_start.isoformat())
+    spy_ohlcv = (_cached_ohlcv(BENCHMARK, timeframe, fetch_start.isoformat())
+                 if st.session_state.pa_compare_spy and ticker != BENCHMARK
+                 else None)
+
+    if ohlcv.empty:
+        st.warning(
+            f"No price data for **{ticker}** ({timeframe}). "
+            "Click **Update price data** to populate the local DB."
+        )
+    else:
+        signal_row = signals.loc[ticker] if ticker in signals.index else None
+
+        fig = build_etf_chart(
+            ohlcv=ohlcv,
+            ticker=ticker,
+            timeframe=timeframe,
+            signal_row=signal_row,
+            show_rsi=st.session_state.pa_show_rsi,
+            show_macd=st.session_state.pa_show_macd,
+            show_bollinger=st.session_state.pa_show_bb,
+            compare_to_spy=st.session_state.pa_compare_spy and ticker != BENCHMARK,
+            spy_ohlcv=spy_ohlcv,
+            visible_start=visible_start,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+    st.markdown("##### Sector grid — click a ticker button to load it above")
+
+    # Batch-load all 11 sector daily frames (mini-chart always uses the same
+    # daily timeframe and the user-selected lookback, for visual consistency).
+    sector_tickers = tuple(SECTOR_ETFS.keys())
+    grid_frame = _cached_ohlcv_multi(sector_tickers, "1d", start.isoformat())
+
+    # 3 columns × 4 rows; UX: candles on top, st.button under each as selector.
+    grid_cols_per_row = 3
+    rows_needed = (len(sector_tickers) + grid_cols_per_row - 1) // grid_cols_per_row
+    for r in range(rows_needed):
+        cols = st.columns(grid_cols_per_row)
+        for c in range(grid_cols_per_row):
+            i = r * grid_cols_per_row + c
+            if i >= len(sector_tickers):
+                continue
+            tk = sector_tickers[i]
+            state = (signals.loc[tk, "state"]
+                     if tk in signals.index else "HOLD")
+            if not grid_frame.empty and tk in grid_frame.columns.get_level_values(0):
+                tk_frame = grid_frame[tk].dropna(how="all")
+            else:
+                tk_frame = pd.DataFrame()
+            with cols[c]:
+                mini = build_mini_chart(tk_frame, tk, state)
+                st.plotly_chart(mini, use_container_width=True,
+                                key=f"pa_mini_{tk}",
+                                config={"displayModeBar": False})
+                if st.button(f"View {tk}", key=f"pa_mini_btn_{tk}",
+                             use_container_width=True):
+                    st.session_state.pa_sector = tk
+                    st.rerun()
+
+
 with tab_expressions:
     from config.expressions import EXPRESSIONS
 
@@ -278,10 +499,36 @@ with tab_expressions:
         "calculate anything."
     )
 
-    prices = _cached_prices()
-    metrics = compute_sector_metrics(prices)
-    sentiment = _cached_sentiment(date.today().isoformat())
-    signals = build_signals(metrics, sentiment)
+    # ---- Update price data (full universe, same wiring as Price Action) ----
+    upd_col, _spacer = st.columns([1, 4])
+    with upd_col:
+        if st.button("🔄 Update price data", key="exp_update_btn"):
+            prog_bar = st.progress(0.0)
+            prog_caption = st.empty()
+            tickers_to_update = _full_price_universe()
+            total_steps = len(tickers_to_update) * 2  # 1d + 1wk
+            done = {"n": 0}
+
+            def _progress(tkr: str, tf: str, status: str) -> None:
+                done["n"] += 1
+                prog_bar.progress(done["n"] / total_steps)
+                prog_caption.caption(f"{tkr} ({tf}): {status}")
+
+            with st.spinner("Updating from yfinance…"):
+                try:
+                    update_all(tickers=tickers_to_update, progress=_progress)
+                except Exception as e:
+                    st.error(f"Update failed: {e}")
+                else:
+                    _cached_ohlcv.clear()
+                    _cached_ohlcv_multi.clear()
+                    _cached_sector_sparklines.clear()
+                    st.success("Price data refreshed.")
+                    st.rerun()
+
+    # Reuse the cached bundle (raw signals are derived from it; refine_signals
+    # adds the `state` column but leaves the underlying `signal` column intact).
+    signals = _cached_signals_bundle(date.today().isoformat())
 
     buys = signals.index[signals["signal"] == "BUY"].tolist()
     if not buys:
@@ -291,21 +538,86 @@ with tab_expressions:
         st.success(f"BUY signals: {', '.join(buys)}")
         sectors_to_show = buys + [s for s in EXPRESSIONS if s not in buys]
 
+    today_iso = date.today().isoformat()
     for sector in sectors_to_show:
         is_buy = sector in buys
         prefix = "🟢" if is_buy else "⚪"
         with st.expander(f"{prefix} {sector} — {SECTOR_ETFS[sector]}", expanded=is_buy):
+            spark_closes = _cached_sector_sparklines(sector, today_iso)
+            missing = [t for t, vals in spark_closes.items() if not vals]
+            if missing:
+                st.caption(f"⚠ {len(missing)} ticker(s) missing price data "
+                           f"({', '.join(missing)}) — click 🔄 Update price data above.")
+
             rows = [
                 {
                     "Ticker": e.ticker,
                     "Label": e.label,
                     "Kind": e.kind.replace("_", " "),
                     "β hint": f"{e.beta_hint:.2f}x",
+                    "60d": spark_closes.get(e.ticker, []),
                     "Note": e.note,
                 }
                 for e in EXPRESSIONS[sector]
             ]
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "60d": st.column_config.LineChartColumn(
+                        "60d", width="medium",
+                        help="Last 60 trading days of daily closes",
+                    ),
+                },
+            )
+
+            # ---- click-through full chart ----
+            # Selectbox is the sole driver: picking a ticker renders the chart
+            # immediately; picking the sentinel hides it. No Show/Hide buttons.
+            choices = [e.ticker for e in EXPRESSIONS[sector]]
+            show_key = f"exp_showing_{sector}"
+            HIDE = "— hide chart —"
+            options = [HIDE] + choices
+            default_index = 0
+            if st.session_state.get(show_key) in choices:
+                default_index = options.index(st.session_state[show_key])
+
+            picked = st.selectbox(
+                "View full chart for:", options,
+                index=default_index,
+                key=f"exp_select_{sector}",
+                label_visibility="collapsed",
+            )
+            st.session_state[show_key] = picked if picked in choices else None
+
+            active_ticker = st.session_state.get(show_key)
+            if active_ticker:
+                # Same warmup pattern as Price Action: load 6M + 300d warmup,
+                # then slice to the visible 6M window inside build_etf_chart.
+                warmup_days = 300
+                visible_days = 183  # 6M
+                fetch_start = date.today() - timedelta(days=visible_days + warmup_days)
+                ohlcv_full = _cached_ohlcv(active_ticker, "1d",
+                                           fetch_start.isoformat())
+                if ohlcv_full.empty:
+                    st.warning(
+                        f"No price data stored for **{active_ticker}**. "
+                        "Click 🔄 Update price data above."
+                    )
+                else:
+                    visible_start = pd.Timestamp(
+                        date.today() - timedelta(days=visible_days)
+                    )
+                    fig = build_etf_chart(
+                        ohlcv_full, active_ticker, "1d",
+                        signal_row=None,
+                        visible_start=visible_start,
+                    )
+                    st.plotly_chart(
+                        fig, use_container_width=True,
+                        key=f"exp_chart_{sector}_{active_ticker}",
+                    )
 
 
 with tab_trend:
