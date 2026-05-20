@@ -13,8 +13,9 @@ from config.settings import (
 from src.charts import STATE_COLORS as _STATE_COLORS, build_etf_chart, build_mini_chart, compute_chart_overlays
 from src.db import aggregate_sentiment, delete_newsletter, init_db, recent_newsletters
 from src.market_engine import (
-    compute_sector_metrics, fetch_macro_prices, fetch_prices,
-    gold_oil_ratio, yield_curve_spread,
+    compute_sector_metrics, copper_gold_ratio, dxy_level,
+    fetch_fred_indicators, fetch_macro_prices, fetch_prices,
+    gold_oil_ratio, vix_level, yield_curve_spread,
 )
 from src.nlp_pipeline import fetch_and_ingest, ingest
 from src.price_store import load_ohlcv, load_ohlcv_multi, update_all
@@ -50,6 +51,13 @@ def _cached_macro_prices() -> pd.DataFrame:
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _cached_yield_curve() -> dict:
     return yield_curve_spread()
+
+# FRED indicators are cached separately from price data: the FRED endpoint
+# occasionally flaps and we don't want a transient FRED failure to evict the
+# yfinance price cache (or vice versa).
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_fred_indicators() -> dict:
+    return fetch_fred_indicators()
 
 @st.cache_data(ttl=10 * 60, show_spinner=False)
 def _cached_sentiment(as_of_iso: str) -> pd.DataFrame:
@@ -88,9 +96,10 @@ st.caption(
     f"SELL <= {PARAMS.sell_sentiment_threshold:+.0f}"
 )
 
-tab_dashboard, tab_price, tab_expressions, tab_trend, tab_inbox, tab_ingest, tab_history = st.tabs(
-    ["📈 Dashboard", "📉 Price Action", "🎯 Expressions", "✨ Trend", "📧 Inbox",
-     "📥 Ingest Newsletter", "🗂 History"]
+(tab_dashboard, tab_macro, tab_price, tab_expressions, tab_trend,
+ tab_inbox, tab_ingest, tab_history) = st.tabs(
+    ["📈 Dashboard", "🌐 Macro", "📉 Price Action", "🎯 Expressions", "✨ Trend",
+     "📧 Inbox", "📥 Ingest Newsletter", "🗂 History"]
 )
 
 with tab_dashboard:
@@ -171,40 +180,7 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
                 )
 
     with right:
-        st.subheader("Macro Regime Indicators")
-
-        macro_prices = _cached_macro_prices()
-        gor = gold_oil_ratio(macro_prices)
-        yc = _cached_yield_curve()
-
-        m1, m2 = st.columns(2)
-        if pd.notna(gor["current"]):
-            m1.metric(
-                "Gold / Oil",
-                f"{gor['current']:.1f}",
-                delta=f"z={gor['z_score_1y']:+.2f}",
-                help="GC=F / CL=F. Higher = risk-off bid for gold / weak oil demand.",
-            )
-        else:
-            m1.metric("Gold / Oil", "—")
-
-        if pd.notna(yc["current"]):
-            slope_per_month = yc["slope_30d"] * 30
-            m2.metric(
-                "10Y - 2Y (FRED)",
-                f"{yc['current']:+.2f}%",
-                delta=f"{slope_per_month:+.2f}%/mo (30d)",
-                help="Treasury 10Y minus 2Y.",
-            )
-        else:
-            m2.metric("10Y - 2Y", "—", help=yc.get("error", ""))
-
-        if "series" in gor:
-            st.line_chart(gor["series"].tail(180), height=140, use_container_width=True)
-        if "series" in yc:
-            st.line_chart(yc["series"], height=140, use_container_width=True)
-
-        st.divider()
+        st.caption("📡 Macro regime indicators have moved to the **🌐 Macro** tab.")
         st.subheader("Tiger Portfolio Drift")
 
         if not tiger_configured():
@@ -264,6 +240,330 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
     if st.button("🔄 Force refresh all caches"):
         st.cache_data.clear()
         st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Macro tab
+# ---------------------------------------------------------------------------
+#
+# Each indicator is rendered as one self-contained block: title + description,
+# metric (current + z or 30d slope), regime badge from the bands table, the
+# full band legend so the user can see where the current reading sits in
+# range, a one-line sector-rotation signal, and a trailing-1y line chart.
+#
+# Band tuples are (label, emoji, range_label, predicate). Bands are tested
+# top-to-bottom; the first matching predicate wins. Ranges are anchored to
+# regime-detection convention, not strict statistical thresholds — they're
+# meant as "is this reading meaningful" guideposts, not trade triggers.
+
+_VIX_BANDS = [
+    ("Complacent", "🟢", "< 12",  lambda v: v < 12),
+    ("Normal",     "🟡", "12–20", lambda v: 12 <= v < 20),
+    ("Stressed",   "🟠", "20–30", lambda v: 20 <= v < 30),
+    ("Crisis",     "🔴", "≥ 30",  lambda v: v >= 30),
+]
+_HY_OAS_BANDS = [
+    ("Tight (risk-on)", "🟢", "< 3.5%",   lambda v: v < 3.5),
+    ("Normal",          "🟡", "3.5–5.0%", lambda v: 3.5 <= v < 5.0),
+    ("Stress building", "🟠", "5.0–7.0%", lambda v: 5.0 <= v < 7.0),
+    ("Credit crisis",   "🔴", "≥ 7.0%",   lambda v: v >= 7.0),
+]
+_GOLD_OIL_BANDS = [
+    ("Oil-rich / pro-cyclical", "🟢", "< 15",  lambda v: v < 15),
+    ("Normal",                  "🟡", "15–25", lambda v: 15 <= v < 25),
+    ("Risk-off bid",            "🟠", "25–35", lambda v: 25 <= v < 35),
+    ("Recession-likely",        "🔴", "≥ 35",  lambda v: v >= 35),
+]
+# Copper/Gold absolute level varies with overall metal prices — band on
+# 1y z-score instead so the regime call is comparable across cycles.
+_COPPER_GOLD_Z_BANDS = [
+    ("Deflationary",     "🔴", "z < -1",   lambda v: v < -1),
+    ("Softening",        "🟠", "-1 to 0",  lambda v: -1 <= v < 0),
+    ("Reflation",        "🟢", "0 to +1",  lambda v: 0 <= v < 1),
+    ("Strong reflation", "🟢", "z ≥ +1",   lambda v: v >= 1),
+]
+_DXY_BANDS = [
+    ("Weak dollar",   "🟢", "< 95",    lambda v: v < 95),
+    ("Normal-weak",   "🟡", "95–100",  lambda v: 95 <= v < 100),
+    ("Normal-strong", "🟠", "100–105", lambda v: 100 <= v < 105),
+    ("Strong dollar", "🔴", "≥ 105",   lambda v: v >= 105),
+]
+_T10Y2Y_BANDS = [
+    ("Inverted (recession warning)", "🔴", "< 0",       lambda v: v < 0),
+    ("Flat",                          "🟠", "0–0.5%",    lambda v: 0 <= v < 0.5),
+    ("Normal",                        "🟡", "0.5–1.5%",  lambda v: 0.5 <= v < 1.5),
+    ("Steep",                         "🟢", "≥ 1.5%",    lambda v: v >= 1.5),
+]
+_UST10_BANDS = [
+    ("Easy",        "🟢", "< 3%", lambda v: v < 3),
+    ("Normal",      "🟡", "3–4%", lambda v: 3 <= v < 4),
+    ("Restrictive", "🟠", "4–5%", lambda v: 4 <= v < 5),
+    ("Tight",       "🔴", "≥ 5%", lambda v: v >= 5),
+]
+_REAL_10Y_BANDS = [
+    ("Financial repression", "🟢", "< 0",  lambda v: v < 0),
+    ("Normal",               "🟡", "0–1%", lambda v: 0 <= v < 1),
+    ("Restrictive",          "🟠", "1–2%", lambda v: 1 <= v < 2),
+    ("Tight",                "🔴", "≥ 2%", lambda v: v >= 2),
+]
+_BREAKEVEN_BANDS = [
+    ("Deflationary fears", "🔴", "< 1.8%",   lambda v: v < 1.8),
+    ("Anchored",           "🟢", "1.8–2.5%", lambda v: 1.8 <= v < 2.5),
+    ("Unanchored",         "🟠", "≥ 2.5%",   lambda v: v >= 2.5),
+]
+
+
+def _find_band(value, bands):
+    if value is None or value != value:  # NaN check without numpy dependency
+        return None
+    for entry in bands:
+        if entry[3](value):
+            return entry
+    return None
+
+
+def _render_macro_indicator(*, label, payload, title, description,
+                            fmt, bands, signal, delta_kind="z",
+                            band_input="current"):
+    """Render one macro indicator block.
+
+    `band_input` is "current" for absolute-level bands, or "z" when bands
+    are defined on the trailing 1y z-score instead (Copper/Gold). `delta_kind`
+    is "z" for z-score deltas, "slope" for 30d slope deltas.
+    """
+    cur = payload.get("current")
+    has_data = pd.notna(cur)
+
+    st.markdown(f"##### {title}")
+    st.caption(description)
+
+    left, right = st.columns([1, 2])
+    with left:
+        if has_data:
+            if delta_kind == "z":
+                z = payload.get("z_score_1y")
+                delta = f"z={z:+.2f}" if pd.notna(z) else None
+            else:
+                slope = payload.get("slope_30d")
+                delta = (f"{slope*30:+.2f}/mo (30d)"
+                         if pd.notna(slope) else None)
+            st.metric(label, fmt.format(cur), delta=delta)
+
+            band_val = (cur if band_input == "current"
+                        else payload.get("z_score_1y"))
+            band = _find_band(band_val, bands)
+            if band:
+                blabel, bemoji, _, _ = band
+                st.markdown(f"**Regime:** {bemoji} {blabel}")
+            else:
+                st.markdown("**Regime:** ⚪ —")
+        else:
+            st.metric(label, "—",
+                      help=payload.get("error", "source unavailable"))
+
+        st.caption("**Bands:** " +
+                   " · ".join(f"{e} {r}" for _, e, r, _ in bands))
+        st.caption(f"**Sector signal:** {signal}")
+
+    with right:
+        if "series" in payload:
+            st.line_chart(payload["series"].tail(252), height=200,
+                          use_container_width=True)
+
+
+with tab_macro:
+    st.subheader("Macro Regime Indicators")
+    st.caption(
+        "Cross-asset signals that shape sector rotation. Each indicator "
+        "shows its current reading, trailing-1y z-score (or 30d slope for "
+        "yields), a regime band, and the sector implication. **Bands are "
+        "rules-of-thumb, not trade triggers** — they're meant to tell you "
+        "what kind of regime you're in, not to time entries."
+    )
+
+    macro_prices = _cached_macro_prices()
+    gor = gold_oil_ratio(macro_prices)
+    cgr = copper_gold_ratio(macro_prices)
+    dxy = dxy_level(macro_prices)
+    vix = vix_level(macro_prices)
+    yc = _cached_yield_curve()
+    fred = _cached_fred_indicators()
+
+    # ---- Risk / Vol ---------------------------------------------------
+    st.divider()
+    st.markdown("### 🛡️ Risk / Vol")
+    st.caption(
+        "Equity-vol and credit-stress gauges. Elevated readings push the "
+        "playbook toward defensives (XLP, XLU, XLV) and away from cyclicals "
+        "(XLF, XLY, XLI, XLB)."
+    )
+
+    _render_macro_indicator(
+        label="VIX",
+        payload=vix,
+        title="VIX — S&P 500 Implied Volatility",
+        description=("30-day expected S&P 500 volatility implied by option "
+                     "prices. Spikes when realized risk rises or when "
+                     "investors bid up tail-protection."),
+        fmt="{:.1f}",
+        bands=_VIX_BANDS,
+        signal=("VIX > 25 → tilt to defensives, trim cyclicals. "
+                "VIX < 13 → complacency; growth re-engagement OK but "
+                "watch for vol expansion."),
+    )
+
+    _render_macro_indicator(
+        label="HY OAS",
+        payload=fred.get("HY_OAS", {}),
+        title="HY OAS — High-Yield Credit Spread",
+        description=("ICE BofA US High-Yield option-adjusted spread over "
+                     "Treasuries. The single best gauge of risk-asset stress; "
+                     "credit cracks before equities do."),
+        fmt="{:.2f}%",
+        bands=_HY_OAS_BANDS,
+        signal=("OAS > 5% → reduce cyclical risk (XLF, XLY, XLI); rising z "
+                "regardless of level is a warning. OAS < 3.5% → credit "
+                "supportive of risk-on rotation."),
+    )
+
+    _render_macro_indicator(
+        label="Gold / Oil",
+        payload=gor,
+        title="Gold / Oil Ratio",
+        description=("GC=F front-month / CL=F front-month. Rises when gold "
+                     "(safe-haven, real-asset hedge) outperforms oil "
+                     "(growth-sensitive demand)."),
+        fmt="{:.1f}",
+        bands=_GOLD_OIL_BANDS,
+        signal=("Ratio > 30 → recession/risk-off bid; favor XLP, XLU, XLV. "
+                "Ratio < 15 → strong oil cycle; XLE tailwind. "
+                "Big z-spikes have led peaks historically."),
+    )
+
+    # ---- Growth / Cycle -----------------------------------------------
+    st.divider()
+    st.markdown("### 📈 Growth / Cycle")
+    st.caption(
+        "Cyclical-vs-defensive cross-asset signals. These move first when "
+        "the global growth impulse shifts."
+    )
+
+    _render_macro_indicator(
+        label="Copper / Gold",
+        payload=cgr,
+        title="Copper / Gold Ratio",
+        description=("HG=F / GC=F. Copper is industrial-demand sensitive; "
+                     "gold is monetary/safe-haven. The ratio is a classic "
+                     "growth/reflation barometer."),
+        fmt="{:.4f}",
+        bands=_COPPER_GOLD_Z_BANDS,
+        band_input="z",
+        signal=("Z > +1 → reflation regime; tailwind for XLB, XLI, XLE. "
+                "Z < -1 → deflationary impulse; rotate to bond proxies "
+                "(XLU, XLRE) and quality defensives."),
+    )
+
+    _render_macro_indicator(
+        label="DXY",
+        payload=dxy,
+        title="DXY — US Dollar Index",
+        description=("Trade-weighted USD vs a basket of major currencies. "
+                     "Tighter US financial conditions and risk-off flows "
+                     "tend to lift the dollar."),
+        fmt="{:.2f}",
+        bands=_DXY_BANDS,
+        signal=("DXY > 105 → headwind for commodities (XLB, XLE) and "
+                "multinational earnings (XLK, XLI). DXY < 95 → commodity "
+                "tailwind, EM-sensitive sectors benefit."),
+    )
+
+    # ---- Rates / Inflation --------------------------------------------
+    st.divider()
+    st.markdown("### 💵 Rates / Inflation")
+    st.caption(
+        "Treasury curve and inflation-expectation signals. The level of "
+        "rates and their direction matter for duration-sensitive sectors "
+        "(XLRE, XLU, XLK) and financial-margin sectors (XLF)."
+    )
+
+    _render_macro_indicator(
+        label="10Y - 2Y",
+        payload=yc,
+        title="10Y - 2Y Treasury Spread",
+        description=("DGS10 - DGS2 from FRED. Inversion has historically "
+                     "preceded recessions by 12-18 months; the steepening "
+                     "out of inversion is the actual recession trigger."),
+        fmt="{:+.2f}%",
+        bands=_T10Y2Y_BANDS,
+        signal=("Inverted → late-cycle; trim cyclicals, build defensives. "
+                "Steepening from inversion → bull steepener supports XLF; "
+                "bear steepener (long end leading) pressures XLRE/XLU."),
+        delta_kind="slope",
+    )
+
+    _render_macro_indicator(
+        label="10Y nominal",
+        payload=fred.get("UST10", {}),
+        title="10Y Nominal Yield",
+        description=("Constant-maturity 10-year Treasury yield. The "
+                     "discount-rate input for everything; rising long-end "
+                     "rates compress long-duration multiples."),
+        fmt="{:.2f}%",
+        bands=_UST10_BANDS,
+        signal=("> 5% → duration headwind, pressure on XLRE, XLU, XLK. "
+                "Rising slope (regardless of level) → defensive long-duration "
+                "rotation; falling slope → growth/duration re-engagement."),
+        delta_kind="slope",
+    )
+
+    _render_macro_indicator(
+        label="10Y real",
+        payload=fred.get("REAL_10Y", {}),
+        title="10Y Real Yield (TIPS)",
+        description=("10-year TIPS yield: the real (inflation-adjusted) "
+                     "cost of capital. The cleanest read on monetary policy "
+                     "stance; arguably more important than the nominal yield."),
+        fmt="{:+.2f}%",
+        bands=_REAL_10Y_BANDS,
+        signal=("Real > 2% → restrictive; headwind for gold miners, XLRE, "
+                "and long-duration growth. Real < 0% → financial repression; "
+                "supportive for risk assets and real-asset proxies."),
+        delta_kind="slope",
+    )
+
+    _render_macro_indicator(
+        label="5Y5Y breakeven",
+        payload=fred.get("BREAKEVEN_5Y5Y", {}),
+        title="5Y5Y Forward Inflation Breakeven",
+        description=("Market-implied inflation expectation for the 5 years "
+                     "starting 5 years from now. The Fed's preferred gauge "
+                     "of long-run inflation credibility."),
+        fmt="{:.2f}%",
+        bands=_BREAKEVEN_BANDS,
+        signal=("< 1.8% → deflation fears, risk-off for cyclicals. "
+                "1.8-2.5% → anchored, neutral. > 2.5% → unanchored / "
+                "reflation; tailwind for XLE, XLB, but watch for hawkish Fed."),
+    )
+
+    st.divider()
+    with st.expander("📖 How to use this tab"):
+        st.markdown(
+            """
+**Reading a single indicator**
+- **Level + regime band** tells you where we are in the cycle.
+- **Z-score (or 30d slope)** tells you the *change* — often the actionable signal.
+- **Sector signal** is the if-then rule for rotation. Treat as a tilt, not a switch.
+
+**Reading the panel together**
+- Look for **agreement**: VIX up + HY OAS up + DXY up + curve flattening = a coherent risk-off regime. Trim cyclicals (XLF, XLY, XLI, XLB) and lean defensive (XLP, XLU, XLV).
+- Look for **divergence**: equity vol calm but credit spreads widening is an early-stress signal — credit cracks before equities.
+- **Direction matters more than level.** A "Normal" reading that's rising fast (z > +1) is often a stronger signal than a "Stressed" reading that's stable.
+
+**Caveats**
+- Bands are calibrated to post-GFC norms. Treat readings in extreme regimes (2020, 2022) as outliers.
+- All signals are *displayed*, not yet wired into `build_signals()`. Use them as a manual sanity overlay on the convergence model output for now.
+            """
+        )
 
 
 # ---------------------------------------------------------------------------

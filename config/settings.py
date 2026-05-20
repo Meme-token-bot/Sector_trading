@@ -30,7 +30,23 @@ SECTOR_ETFS: dict[str, str] = {
     "XLRE": "Real Estate",
 }
 BENCHMARK = "SPY"
-MACRO_TICKERS = {"GOLD": "GC=F", "OIL": "CL=F"}
+MACRO_TICKERS = {
+    "GOLD":   "GC=F",
+    "OIL":    "CL=F",
+    "DXY":    "DX-Y.NYB",
+    "COPPER": "HG=F",
+    "VIX":    "^VIX",
+}
+
+# FRED series IDs pulled via the direct-CSV pattern (see market_engine).
+# Kept here so callers reference logical names, not bare series strings.
+FRED_SERIES = {
+    "HY_OAS":         "BAMLH0A0HYM2",   # ICE BofA US HY OAS, %, daily
+    "UST10":          "DGS10",          # 10Y constant-maturity nominal, %, daily
+    "REAL_10Y":       "DFII10",         # 10Y TIPS real yield, %, daily
+    "BREAKEVEN_5Y5Y": "T5YIFR",         # 5y5y forward inflation expectation, %, daily
+    "T10Y2Y":         "T10Y2Y",         # 10Y - 2Y spread, %, daily
+}
 
 # --- signal parameters --------------------------------------------------
 @dataclass(frozen=True)
