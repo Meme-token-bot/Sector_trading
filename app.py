@@ -1014,6 +1014,35 @@ with tab_expressions:
                     )
 
 
+# ---------------------------------------------------------------------------
+# Shared helper — connection status card (Agent C scope)
+# Placed here (just above tab_trend) to stay within Agent C's scope and
+# avoid merge collisions with Agents A/B who may add helpers near the top
+# of the global-helpers band.
+# ---------------------------------------------------------------------------
+
+def connection_status_card(
+    label: str,
+    account: str,
+    detail: str | None = None,
+) -> None:
+    """Render a two-column connection-status row.
+
+    Left cell: bold label. Right cell: monospace account string. An optional
+    dimmer detail line is appended below the account if supplied.
+
+    Args:
+        label:   Short descriptor, e.g. "Account" or "Filter".
+        account: The address / value to display in monospace.
+        detail:  Optional secondary line, rendered as a small caption.
+    """
+    left, right = st.columns([1, 3])
+    left.markdown(f"**{label}**")
+    right.markdown(f"`{account}`")
+    if detail:
+        right.caption(detail)
+
+
 with tab_trend:
     section(
         "Sentiment Trend",
@@ -1032,12 +1061,15 @@ with tab_trend:
         active = trend.dropna(how="all", axis=1)
         sector_labels = {t: f"{t} — {SECTOR_ETFS[t]}" for t in active.columns}
 
-        st.markdown("##### Per-sector sentiment over time")
+        section(
+            "Per-sector sentiment over time",
+            help="BUY threshold = +2 (top), SELL threshold = −3 (bottom).",
+            level=3,
+        )
         line_df = active.rename(columns=sector_labels)
         st.line_chart(line_df, height=320, use_container_width=True)
-        st.caption("BUY threshold = +2 (top), SELL threshold = −3 (bottom).")
 
-        st.markdown("##### Sectors × weeks heatmap")
+        section("Sectors × weeks heatmap", level=3)
         try:
             import plotly.express as px
             heat = active.T  # rows = sectors, cols = weeks
@@ -1057,7 +1089,7 @@ with tab_trend:
             st.warning(f"Heatmap unavailable: {e}")
             st.dataframe(active.round(2), use_container_width=True)
 
-        with st.expander("Raw weekly snapshots"):
+        with st.expander("Underlying data"):
             st.dataframe(active.round(2), use_container_width=True)
 
 
@@ -1079,25 +1111,34 @@ with tab_inbox:
             "(2FA must be enabled on your Google account first). See SETUP.md for the full walkthrough."
         )
     else:
-        c1, c2 = st.columns(2)
-        c1.markdown(f"**Account:** `{GMAIL_ADDRESS}`")
-        c2.markdown(f"**Filter:** `{GMAIL_FILTER_ADDRESS or '(none — all unread)'}`")
+        connection_status_card("Account", GMAIL_ADDRESS)
+        connection_status_card(
+            "Filter",
+            GMAIL_FILTER_ADDRESS or "(none — all unread)",
+        )
 
-        b1, b2, b3 = st.columns([1, 1, 2])
-        if b1.button("🔌 Test connection"):
+        # Row 1: action buttons, left-aligned
+        btn_col1, btn_col2, _ = st.columns([1, 1, 2])
+        if btn_col1.button("🔌 Test connection"):
             from src.gmail_client import test_connection
             with st.spinner("Connecting…"):
                 ok, msg = test_connection()
             (st.success if ok else st.error)(msg)
 
-        follow = b3.checkbox("Follow whitelisted links / PDFs",
-                             value=True,
-                             help="Disable for a faster, cheaper, body-only run.")
-        mark_seen = b3.checkbox("Mark messages as read after ingesting",
-                                value=True,
-                                help="Required for incremental runs. Uncheck while testing.")
+        # Row 2: secondary toggles — given their own row so labels are not truncated
+        chk_col1, chk_col2 = st.columns(2)
+        follow = chk_col1.checkbox(
+            "Follow whitelisted links / PDFs",
+            value=True,
+            help="Disable for a faster, cheaper, body-only run.",
+        )
+        mark_seen = chk_col2.checkbox(
+            "Mark messages as read after ingesting",
+            value=True,
+            help="Required for incremental runs. Uncheck while testing.",
+        )
 
-        if b2.button("📥 Fetch & parse all", type="primary"):
+        if btn_col2.button("📥 Fetch & parse all", type="primary"):
             with st.spinner("Fetching mail and calling OpenAI…"):
                 try:
                     report = fetch_and_ingest(mark_seen=mark_seen, follow_links=follow)
@@ -1145,7 +1186,7 @@ with tab_ingest:
         author_hint = st.text_input("Author (optional)", "")
         date_hint = st.date_input("Publication date", date.today())
     with col_l:
-        raw_text = st.text_area("Newsletter text", height=380,
+        raw_text = st.text_area("Newsletter text", height=260,
                                 placeholder="Paste the full text of the piece here…")
 
     if st.button("Parse & Save", type="primary", disabled=not raw_text.strip()):
@@ -1159,13 +1200,46 @@ with tab_ingest:
                     st.warning("Duplicate of an existing entry — nothing saved.")
                 else:
                     st.success(f"Saved newsletter #{nid}")
-                st.json({
-                    "author": analysis.author,
-                    "publication_date": analysis.publication_date.isoformat(),
-                    "overall_macro_bias": analysis.overall_macro_bias.value,
-                    "summary": analysis.summary,
-                    "sector_ratings": [r.model_dump() for r in analysis.sector_ratings],
-                })
+
+                # --- Structured parse-result panel ---
+                # Row 1: three summary metrics
+                pm1, pm2, pm3 = st.columns(3)
+                pm1.metric("Author", analysis.author or "—")
+                pm2.metric(
+                    "Publication date",
+                    analysis.publication_date.isoformat() if analysis.publication_date else "—",
+                )
+                pm3.metric("Macro bias", analysis.overall_macro_bias.value)
+
+                # Row 2: summary prose
+                if analysis.summary:
+                    st.markdown(analysis.summary)
+
+                # Row 3: sector ratings table
+                if analysis.sector_ratings:
+                    ratings_rows = [r.model_dump() for r in analysis.sector_ratings]
+                    ratings_df = pd.DataFrame(ratings_rows)
+                    # Surface the most useful columns first; keep others if present
+                    preferred = ["ticker", "score", "reasoning"]
+                    cols_ordered = [c for c in preferred if c in ratings_df.columns] + [
+                        c for c in ratings_df.columns if c not in preferred
+                    ]
+                    st.dataframe(
+                        ratings_df[cols_ordered],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                # Raw JSON available for debugging — hidden by default
+                with st.expander("Show raw JSON"):
+                    st.json({
+                        "author": analysis.author,
+                        "publication_date": analysis.publication_date.isoformat(),
+                        "overall_macro_bias": analysis.overall_macro_bias.value,
+                        "summary": analysis.summary,
+                        "sector_ratings": [r.model_dump() for r in analysis.sector_ratings],
+                    })
+
                 _cached_sentiment.clear()
                 _cached_trend.clear()
                 _cached_signal_history.clear()
@@ -1177,8 +1251,8 @@ with tab_history:
     if hist.empty:
         st.info("No newsletters ingested yet. Use the Ingest tab.")
     else:
-        st.dataframe(hist, use_container_width=True, height=400)
-        with st.expander("Delete an entry"):
+        st.dataframe(hist, use_container_width=True, height=320)
+        with st.expander("🗑 Delete an entry"):
             ids = hist["id"].tolist()
             target_id = st.selectbox("Newsletter id to delete", ids)
             if st.button("Delete", type="secondary"):
@@ -1188,15 +1262,3 @@ with tab_history:
                 _cached_signal_history.clear()
                 st.success(f"Deleted #{target_id}")
                 st.rerun()
-
-    st.divider()
-    st.subheader("Current Aggregate Sentiment (rolling window)")
-    sent = _cached_sentiment(date.today().isoformat())
-    if sent.empty:
-        st.info("No sentiment in the rolling window.")
-    else:
-        sent_view = sent.copy()
-        sent_view["sector"] = sent_view.index.map(SECTOR_ETFS)
-        sent_view["score"] = sent_view["score"].map("{:+.2f}".format)
-        st.dataframe(sent_view[["sector", "score", "n_obs"]].sort_values("n_obs", ascending=False),
-                     use_container_width=True)
