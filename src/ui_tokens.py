@@ -146,18 +146,23 @@ def section(title: str, help: str | None = None, *, level: int = 2) -> None:
     Args:
         title: Section heading text.
         help:  Optional explanatory caption shown below the heading.
-        level: Heading level — 1 through 4 (default 2 = H2).  Maps to
-               st.title / st.header / st.subheader / st.subheader (H4 via
-               markdown) since Streamlit only has three native heading calls.
+        level: Heading level — 1 through 4 (default 2).  Maps to:
+               1 → st.header  (H2 — tab-level)
+               2 → st.subheader (H3 — default; opens each tab)
+               3 → markdown #### (H4 — inner section breaks)
+               4 → markdown ##### (H5 — atomic block titles)
+               This gives a continuous H2→H5 hierarchy.  Previously
+               level=3 rendered H5, which collided with per-indicator
+               H5 titles inside _render_macro_indicator on the Macro tab.
     """
     if level == 1:
         st.header(title)
     elif level == 2:
         st.subheader(title)
     elif level == 3:
-        st.markdown(f"##### {title}")
+        st.markdown(f"#### {title}")
     else:
-        st.markdown(f"###### {title}")
+        st.markdown(f"##### {title}")
 
     if help:
         st.caption(help)

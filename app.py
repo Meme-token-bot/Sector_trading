@@ -1034,10 +1034,23 @@ with tab_expressions:
             + [s for s in EXPRESSIONS if s not in buy_class_sectors]
         )
 
+    # State → prefix mapping mirrors the Dashboard's "How to read the State
+    # column" legend so the same color/emoji means the same thing across tabs.
+    # Collapsing NEW_BUY and HOLD_IF_LONG into a single 🟢 would hide the
+    # critical "hold if owned, don't add fresh" distinction.
+    _STATE_PREFIX = {
+        "NEW_BUY":      "🟢",
+        "HOLD_IF_LONG": "🟡",
+        "CHASE":        "🟠",
+        "REDUCE":       "🟤",
+        "SELL":         "🔴",
+    }
+
     today_iso = date.today().isoformat()
     for sector in sectors_to_show:
-        is_buy_class = sector in buy_class_sectors
-        prefix = "🟢" if is_buy_class else "⚪"
+        parent_state = str(signals["state"].get(sector, "HOLD"))
+        is_buy_class = parent_state in {"NEW_BUY", "HOLD_IF_LONG"}
+        prefix = _STATE_PREFIX.get(parent_state, "⚪")
         with st.expander(f"{prefix} {sector} — {SECTOR_ETFS[sector]}", expanded=is_buy_class):
             spark_closes = _cached_sector_sparklines(sector, today_iso)
             missing = [t for t, vals in spark_closes.items() if not vals]
@@ -1045,7 +1058,6 @@ with tab_expressions:
                 st.caption(f"⚠ {len(missing)} ticker(s) missing price data "
                            f"({', '.join(missing)}) — click 🔄 Update price data above.")
 
-            parent_state = str(signals["state"].get(sector, "HOLD"))
             exp_sigs = _cached_expression_signals(sector, parent_state, today_iso)
             sig_by_ticker = {d["ticker"]: d for d in exp_sigs}
 
