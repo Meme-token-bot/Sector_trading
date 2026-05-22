@@ -12,6 +12,7 @@ from config.settings import (
 )
 from src.charts import STATE_COLORS as _STATE_COLORS, build_etf_chart, build_mini_chart, compute_chart_overlays
 from src.db import aggregate_sentiment, delete_newsletter, init_db, recent_newsletters
+from src.expression_signals import compute_expressions_for_sector
 from src.market_engine import (
     compute_sector_metrics, copper_gold_ratio, dxy_level,
     fetch_fred_indicators, fetch_macro_prices, fetch_prices,
@@ -622,6 +623,47 @@ def _cached_sector_sparklines(sector: str, as_of_iso: str) -> dict[str, list[flo
     return out
 
 
+EXPRESSION_STATE_COLORS: dict[str, tuple[str, str]] = {
+    # state -> (background, text/accent)
+    "CONFIRMED":       ("#143d2a", "#2ecc71"),
+    "LAGGING":         ("#3d3a14", "#f1c40f"),
+    "STRETCHED":       ("#4a3214", "#e67e22"),
+    "BROKEN":          ("#4a1818", "#e74c3c"),
+    "WARMING_UP":      ("#2a2a2a", "#888888"),
+    "PARENT_INACTIVE": ("", "#666666"),
+    "NO_DATA":         ("#2a1414", "#aa6666"),
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_expression_signals(
+    sector: str, parent_state: str, as_of_iso: str
+) -> list[dict]:
+    """Per-expression self-check signals for one sector.
+
+    Returns a list of plain dicts (not the dataclass) so streamlit's cache
+    doesn't choke on the frozen dataclass and so the call site doesn't have
+    to re-import the type.
+    """
+    warmup_start = date.fromisoformat(as_of_iso) - timedelta(days=300)
+
+    def _loader(ticker: str) -> pd.Series:
+        df = load_ohlcv(ticker, "1d", start=warmup_start)
+        if df.empty:
+            return pd.Series(dtype=float)
+        return df["close"]
+
+    sigs = compute_expressions_for_sector(sector, parent_state, _loader)
+    return [
+        {
+            "ticker": s.ticker,
+            "state": s.state,
+            "reason": s.reason,
+        }
+        for s in sigs
+    ]
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_signals_bundle(as_of_iso: str) -> pd.DataFrame:
     """Re-compute the same signals bundle the Dashboard tab uses. Cached so
@@ -823,6 +865,7 @@ with tab_expressions:
                     _cached_ohlcv.clear()
                     _cached_ohlcv_multi.clear()
                     _cached_sector_sparklines.clear()
+                    _cached_expression_signals.clear()
                     st.success("Price data refreshed.")
                     st.rerun()
 
@@ -849,19 +892,43 @@ with tab_expressions:
                 st.caption(f"⚠ {len(missing)} ticker(s) missing price data "
                            f"({', '.join(missing)}) — click 🔄 Update price data above.")
 
-            rows = [
-                {
+            parent_state = str(signals["state"].get(sector, "HOLD"))
+            exp_sigs = _cached_expression_signals(sector, parent_state, today_iso)
+            sig_by_ticker = {d["ticker"]: d for d in exp_sigs}
+
+            rows = []
+            for e in EXPRESSIONS[sector]:
+                s = sig_by_ticker.get(e.ticker, {"state": "NO_DATA", "reason": ""})
+                rows.append({
                     "Ticker": e.ticker,
                     "Label": e.label,
                     "Kind": e.kind.replace("_", " "),
                     "β hint": f"{e.beta_hint:.2f}x",
                     "60d": spark_closes.get(e.ticker, []),
+                    "Self-check": s["state"],
+                    "Self-check reason": s["reason"],
                     "Note": e.note,
-                }
-                for e in EXPRESSIONS[sector]
-            ]
+                })
+            df_rows = pd.DataFrame(rows)
+            column_order = ["Ticker", "Label", "Kind", "β hint", "60d",
+                            "Self-check", "Self-check reason", "Note"]
+            df_rows = df_rows[column_order]
+
+            def _style_selfcheck(col: pd.Series) -> list[str]:
+                out = []
+                for v in col:
+                    bg, fg = EXPRESSION_STATE_COLORS.get(str(v), ("", ""))
+                    if bg:
+                        out.append(f"background-color: {bg}; color: {fg}")
+                    elif fg:
+                        out.append(f"color: {fg}")
+                    else:
+                        out.append("")
+                return out
+
+            styled = df_rows.style.apply(_style_selfcheck, subset=["Self-check"])
             st.dataframe(
-                pd.DataFrame(rows),
+                styled,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -869,8 +936,37 @@ with tab_expressions:
                         "60d", width="medium",
                         help="Last 60 trading days of daily closes",
                     ),
+                    "Self-check": st.column_config.TextColumn(
+                        "Self-check", width="small",
+                        help="Per-expression participation check vs the parent sector",
+                    ),
+                    "Self-check reason": st.column_config.TextColumn(
+                        "Self-check reason", width="large",
+                    ),
                 },
             )
+
+            with st.expander("How to read the Self-check column"):
+                cutoff_pct = PARAMS.extension_pct_cutoff * 100
+                st.markdown(
+                    f"""
+- **CONFIRMED** — Parent is NEW_BUY/HOLD_IF_LONG, the expression is above its
+  own SMA200, its 3-month return ≥ the parent's, and its own extension is
+  within the beta-scaled cutoff ({cutoff_pct:.0f}% × β). Safe participating vehicle.
+- **LAGGING** — Parent BUY-class, expression up-trending and not extended, but
+  3-month return < parent's. Vehicle is rising slower than the sector — pick a
+  different expression.
+- **STRETCHED** — Parent BUY-class, above own SMA200, but own extension >
+  beta-scaled cutoff ({cutoff_pct:.0f}% × β). Too far above its own trend; wait.
+- **BROKEN** — Parent BUY-class, but price < own SMA200. The vehicle is in
+  its own downtrend regardless of the sector — avoid.
+- **WARMING_UP** — Fewer than {PARAMS.sma_window} daily bars stored; SMA200
+  not computable yet.
+- **PARENT_INACTIVE** — Parent sector is not in NEW_BUY/HOLD_IF_LONG. No
+  expression-level call — defer to the parent signal.
+- **NO_DATA** — No price data stored for this ticker. Hit *🔄 Update price data*.
+"""
+                )
 
             # ---- click-through full chart ----
             # Selectbox is the sole driver: picking a ticker renders the chart
