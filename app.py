@@ -11,6 +11,7 @@ from config.settings import (
     SECTOR_ETFS, gmail_configured, tiger_configured,
 )
 from src.charts import STATE_COLORS as _STATE_COLORS, build_etf_chart, build_mini_chart, compute_chart_overlays
+from src.ui_tokens import EXPRESSION_STATE_COLORS, render_header, section
 from src.db import aggregate_sentiment, delete_newsletter, init_db, recent_newsletters
 from src.expression_signals import compute_expressions_for_sector
 from src.market_engine import (
@@ -90,11 +91,13 @@ def _fmt_pct(x: float) -> str:
     return f"{x*100:+.2f}%" if pd.notna(x) else "—"
 
 
-st.title("📊 Sector Rotation — Macro-Filtered Convergence Model")
-st.caption(
-    f"11 US SPDR Select Sector ETFs · benchmark **{BENCHMARK}** · "
-    f"weekly cadence · BUY threshold sentiment >= +{PARAMS.buy_sentiment_threshold:.0f}, "
-    f"SELL <= {PARAMS.sell_sentiment_threshold:+.0f}"
+render_header(
+    "📊 Sector Rotation — Macro-Filtered Convergence Model",
+    subtitle=(
+        f"11 US SPDR Select Sector ETFs · benchmark **{BENCHMARK}** · "
+        f"weekly cadence · BUY threshold sentiment >= +{PARAMS.buy_sentiment_threshold:.0f}, "
+        f"SELL <= {PARAMS.sell_sentiment_threshold:+.0f}"
+    ),
 )
 
 (tab_dashboard, tab_macro, tab_price, tab_expressions, tab_trend,
@@ -373,13 +376,15 @@ def _render_macro_indicator(*, label, payload, title, description,
 
 
 with tab_macro:
-    st.subheader("Macro Regime Indicators")
-    st.caption(
-        "Cross-asset signals that shape sector rotation. Each indicator "
-        "shows its current reading, trailing-1y z-score (or 30d slope for "
-        "yields), a regime band, and the sector implication. **Bands are "
-        "rules-of-thumb, not trade triggers** — they're meant to tell you "
-        "what kind of regime you're in, not to time entries."
+    section(
+        "Macro Regime Indicators",
+        help=(
+            "Cross-asset signals that shape sector rotation. Each indicator "
+            "shows its current reading, trailing-1y z-score (or 30d slope for "
+            "yields), a regime band, and the sector implication. **Bands are "
+            "rules-of-thumb, not trade triggers** — they're meant to tell you "
+            "what kind of regime you're in, not to time entries."
+        ),
     )
 
     macro_prices = _cached_macro_prices()
@@ -623,17 +628,6 @@ def _cached_sector_sparklines(sector: str, as_of_iso: str) -> dict[str, list[flo
     return out
 
 
-EXPRESSION_STATE_COLORS: dict[str, tuple[str, str]] = {
-    # state -> (background, text/accent)
-    "CONFIRMED":       ("#143d2a", "#2ecc71"),
-    "LAGGING":         ("#3d3a14", "#f1c40f"),
-    "STRETCHED":       ("#4a3214", "#e67e22"),
-    "BROKEN":          ("#4a1818", "#e74c3c"),
-    "WARMING_UP":      ("#2a2a2a", "#888888"),
-    "PARENT_INACTIVE": ("", "#666666"),
-    "NO_DATA":         ("#2a1414", "#aa6666"),
-}
-
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_expression_signals(
@@ -678,11 +672,13 @@ def _cached_signals_bundle(as_of_iso: str) -> pd.DataFrame:
 
 
 with tab_price:
-    st.subheader("Price Action")
-    st.caption(
-        "Candles, SMA50/200, optional RSI/MACD/Bollinger. Data is served from "
-        "the local prices DB (5y of 1d + 1wk). Use **Update price data** to "
-        "incrementally pull the latest bars from yfinance."
+    section(
+        "Price Action",
+        help=(
+            "Candles, SMA50/200, optional RSI/MACD/Bollinger. Data is served from "
+            "the local prices DB (5y of 1d + 1wk). Use **Update price data** to "
+            "incrementally pull the latest bars from yfinance."
+        ),
     )
 
     signals = _cached_signals_bundle(date.today().isoformat())
@@ -831,14 +827,16 @@ with tab_price:
 with tab_expressions:
     from config.expressions import EXPRESSIONS
 
-    st.subheader("Expression Picker — what to actually buy when a sector fires BUY")
-    st.caption(
-        "Each sector signal (XLK, XLB, ...) maps to plain and operating-leverage "
-        "equity ETFs. All expressions are unleveraged equity funds — operating "
-        "leverage comes from the underlying businesses (e.g. miners' fixed costs), "
-        "not from derivatives or daily rebalancing. `beta_hint` is a rough "
-        "3-month price beta vs the signal ETF; use it to size positions, not to "
-        "calculate anything."
+    section(
+        "Expression Picker — what to actually buy when a sector fires BUY",
+        help=(
+            "Each sector signal (XLK, XLB, ...) maps to plain and operating-leverage "
+            "equity ETFs. All expressions are unleveraged equity funds — operating "
+            "leverage comes from the underlying businesses (e.g. miners' fixed costs), "
+            "not from derivatives or daily rebalancing. `beta_hint` is a rough "
+            "3-month price beta vs the signal ETF; use it to size positions, not to "
+            "calculate anything."
+        ),
     )
 
     # ---- Update price data (full universe, same wiring as Price Action) ----
@@ -1017,11 +1015,13 @@ with tab_expressions:
 
 
 with tab_trend:
-    st.subheader("Sentiment Trend")
-    st.caption(
-        f"Weekly snapshots of the rolling-window aggregate sentiment, reconstructed "
-        f"from your full ingest history. Window = {PARAMS.sentiment_lookback_days} days "
-        f"(set in `config/settings.py`). NaN cells = no coverage in that window."
+    section(
+        "Sentiment Trend",
+        help=(
+            f"Weekly snapshots of the rolling-window aggregate sentiment, reconstructed "
+            f"from your full ingest history. Window = {PARAMS.sentiment_lookback_days} days "
+            f"(set in `config/settings.py`). NaN cells = no coverage in that window."
+        ),
     )
 
     trend = _cached_trend(date.today().isoformat(), PARAMS.sentiment_lookback_days)
@@ -1062,11 +1062,13 @@ with tab_trend:
 
 
 with tab_inbox:
-    st.subheader("Gmail Inbox")
-    st.caption(
-        "Pulls unread mail matching your filter address, enriches with whitelisted "
-        "links + PDF attachments, and pushes the assembled context through gpt-4o-mini. "
-        "Each successful ingest also stamps the Gmail Message-ID so a re-run is a no-op."
+    section(
+        "Gmail Inbox",
+        help=(
+            "Pulls unread mail matching your filter address, enriches with whitelisted "
+            "links + PDF attachments, and pushes the assembled context through gpt-4o-mini. "
+            "Each successful ingest also stamps the Gmail Message-ID so a re-run is a no-op."
+        ),
     )
 
     if not gmail_configured():
@@ -1130,9 +1132,13 @@ with tab_inbox:
 
 
 with tab_ingest:
-    st.subheader("Ingest a Newsletter")
-    st.caption("Paste the body of a macro newsletter. GPT-4o-mini will extract a "
-               "structured rating per sector and persist it to SQLite.")
+    section(
+        "Ingest a Newsletter",
+        help=(
+            "Paste the body of a macro newsletter. GPT-4o-mini will extract a "
+            "structured rating per sector and persist it to SQLite."
+        ),
+    )
 
     col_l, col_r = st.columns([3, 1])
     with col_r:
@@ -1166,7 +1172,7 @@ with tab_ingest:
 
 
 with tab_history:
-    st.subheader("Recent Newsletters")
+    section("Recent Newsletters")
     hist = recent_newsletters(50)
     if hist.empty:
         st.info("No newsletters ingested yet. Use the Ingest tab.")
