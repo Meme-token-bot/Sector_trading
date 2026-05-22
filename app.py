@@ -42,6 +42,54 @@ def _full_price_universe() -> list[str]:
     return list(dict.fromkeys([*SECTOR_ETFS, BENCHMARK, *all_expression_tickers()]))
 
 
+def _render_update_price_data_button(
+    key: str, extra_clears: list | None = None
+) -> None:
+    """Render the "Update price data" button with progress wiring.
+
+    Shared between the Price Action tab (key="pa_update_btn") and the
+    Expressions tab (key="exp_update_btn").  Always clears _cached_ohlcv and
+    _cached_ohlcv_multi on success; callers may pass additional cache
+    functions via ``extra_clears`` (e.g. _cached_sector_sparklines and
+    _cached_expression_signals for the Expressions tab).
+
+    The set of caches cleared is identical to what the two individual
+    call-sites cleared before extraction — no new or removed invalidations.
+
+    Args:
+        key:          Streamlit button key (must be unique per tab).
+        extra_clears: Optional list of additional ``@st.cache_data``
+                      function objects whose ``.clear()`` method will be
+                      called on a successful update.
+    """
+    if st.button("🔄 Update price data", key=key):
+        prog_bar = st.progress(0.0)
+        prog_caption = st.empty()
+        tickers_to_update = _full_price_universe()
+        total_steps = len(tickers_to_update) * 2  # 1d + 1wk
+        done = {"n": 0}
+
+        def _progress(tkr: str, tf: str, status: str) -> None:
+            done["n"] += 1
+            prog_bar.progress(done["n"] / total_steps)
+            prog_caption.caption(f"{tkr} ({tf}): {status}")
+
+        with st.spinner("Updating from yfinance…"):
+            try:
+                update_all(tickers=tickers_to_update, progress=_progress)
+            except Exception as e:
+                st.error(f"Update failed: {e}")
+            else:
+                # Standard invalidation — always clear these two.
+                _cached_ohlcv.clear()
+                _cached_ohlcv_multi.clear()
+                # Per-caller extras (e.g. sparklines + expression signals).
+                for fn in (extra_clears or []):
+                    fn.clear()
+                st.success("Price data refreshed.")
+                st.rerun()
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _cached_prices() -> pd.DataFrame:
     return fetch_prices(list(SECTOR_ETFS.keys()) + [BENCHMARK])
@@ -794,52 +842,36 @@ with tab_price:
     if "pa_show_bb" not in st.session_state:
         st.session_state.pa_show_bb = False
 
-    # ---- toolbar ----
-    tb1, tb2, tb3, tb4 = st.columns([1.3, 1, 1.2, 1.2])
-    with tb1:
-        st.selectbox(
-            "Sector", all_tickers, key="pa_sector",
-            format_func=lambda t: f"{t} — {SECTOR_ETFS.get(t, 'Benchmark')}",
-        )
-    with tb2:
-        st.radio("Timeframe", ["Daily", "Weekly"], key="pa_timeframe",
-                 horizontal=True)
-    with tb3:
-        st.radio("Lookback", list(_LOOKBACK_DAYS.keys()), key="pa_lookback",
-                 horizontal=True)
-    with tb4:
-        st.checkbox("Compare to SPY", key="pa_compare_spy")
-        if st.button("🔄 Update price data", key="pa_update_btn"):
-            prog_bar = st.progress(0.0)
-            prog_caption = st.empty()
-            # Update the full price universe (signals + expressions) so the
-            # Expressions tab has data too — not just the signal sectors.
-            tickers_to_update = _full_price_universe()
-            total_steps = len(tickers_to_update) * 2  # 1d + 1wk
-            done = {"n": 0}
+    # ---- control strip: two logical groups separated by an expander + action ----
+    # Left group: display-state controls (what you're looking at).
+    # Right group: overlay popover + Compare-to-SPY + Update action.
+    left_ctrl, right_ctrl = st.columns([3, 2], gap="small")
 
-            def _progress(tkr: str, tf: str, status: str) -> None:
-                done["n"] += 1
-                prog_bar.progress(done["n"] / total_steps)
-                prog_caption.caption(f"{tkr} ({tf}): {status}")
+    with left_ctrl:
+        lc1, lc2, lc3 = st.columns(3)
+        with lc1:
+            st.selectbox(
+                "Sector", all_tickers, key="pa_sector",
+                format_func=lambda t: f"{t} — {SECTOR_ETFS.get(t, 'Benchmark')}",
+            )
+        with lc2:
+            st.radio("Timeframe", ["Daily", "Weekly"], key="pa_timeframe",
+                     horizontal=True)
+        with lc3:
+            st.radio("Lookback", list(_LOOKBACK_DAYS.keys()), key="pa_lookback",
+                     horizontal=True)
 
-            with st.spinner("Updating from yfinance…"):
-                try:
-                    update_all(tickers=tickers_to_update, progress=_progress)
-                except Exception as e:
-                    st.error(f"Update failed: {e}")
-                else:
-                    # Targeted invalidation — don't nuke Dashboard caches.
-                    _cached_ohlcv.clear()
-                    _cached_ohlcv_multi.clear()
-                    st.success("Price data refreshed.")
-                    st.rerun()
-
-    # Indicator checkboxes
-    ic1, ic2, ic3 = st.columns(3)
-    ic1.checkbox("RSI(14)", key="pa_show_rsi")
-    ic2.checkbox("MACD(12,26,9)", key="pa_show_macd")
-    ic3.checkbox("Bollinger Bands (20, 2σ)", key="pa_show_bb")
+    with right_ctrl:
+        oc1, oc2, oc3 = st.columns([1, 1, 1])
+        with oc1:
+            with st.popover("Indicators"):
+                st.checkbox("RSI(14)", key="pa_show_rsi")
+                st.checkbox("MACD(12,26,9)", key="pa_show_macd")
+                st.checkbox("Bollinger Bands (20, 2σ)", key="pa_show_bb")
+        with oc2:
+            st.checkbox("Compare to SPY", key="pa_compare_spy")
+        with oc3:
+            _render_update_price_data_button(key="pa_update_btn")
 
     # ---- main chart ----
     ticker = st.session_state.pa_sector
@@ -880,8 +912,11 @@ with tab_price:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    st.divider()
-    st.markdown("##### Sector grid — click a ticker button to load it above")
+    section(
+        "Sector grid",
+        help="Click a ticker button to load it in the chart above.",
+        level=3,
+    )
 
     # Batch-load all 11 sector daily frames (mini-chart always uses the same
     # daily timeframe and the user-selected lookback, for visual consistency).
@@ -889,6 +924,10 @@ with tab_price:
     grid_frame = _cached_ohlcv_multi(sector_tickers, "1d", start.isoformat())
 
     # 3 columns × 4 rows; UX: candles on top, st.button under each as selector.
+    # Button uses type="primary" for BUY-class states so the grid reads as a
+    # state map at a glance — chart title color (from build_mini_chart) carries
+    # the precise state; the button type reinforces actionable vs non-actionable.
+    _BUY_CLASS_STATES = {"NEW_BUY", "HOLD_IF_LONG"}
     grid_cols_per_row = 3
     rows_needed = (len(sector_tickers) + grid_cols_per_row - 1) // grid_cols_per_row
     for r in range(rows_needed):
@@ -909,8 +948,9 @@ with tab_price:
                 st.plotly_chart(mini, use_container_width=True,
                                 key=f"pa_mini_{tk}",
                                 config={"displayModeBar": False})
+                btn_type = "primary" if state in _BUY_CLASS_STATES else "secondary"
                 if st.button(f"View {tk}", key=f"pa_mini_btn_{tk}",
-                             use_container_width=True):
+                             use_container_width=True, type=btn_type):
                     st.session_state.pa_sector = tk
                     st.rerun()
 
@@ -930,51 +970,75 @@ with tab_expressions:
         ),
     )
 
-    # ---- Update price data (full universe, same wiring as Price Action) ----
-    upd_col, _spacer = st.columns([1, 4])
+    # ---- Top control row ----
+    upd_col, asof_col, toggle_col = st.columns([1, 2, 2])
     with upd_col:
-        if st.button("🔄 Update price data", key="exp_update_btn"):
-            prog_bar = st.progress(0.0)
-            prog_caption = st.empty()
-            tickers_to_update = _full_price_universe()
-            total_steps = len(tickers_to_update) * 2  # 1d + 1wk
-            done = {"n": 0}
+        _render_update_price_data_button(
+            key="exp_update_btn",
+            extra_clears=[_cached_sector_sparklines, _cached_expression_signals],
+        )
+    with asof_col:
+        st.caption(f"as of {date.today().isoformat()}")
+    with toggle_col:
+        st.toggle(
+            "Show only BUY/HOLD_IF_LONG",
+            key="exp_show_only_buys",
+            value=False,
+        )
 
-            def _progress(tkr: str, tf: str, status: str) -> None:
-                done["n"] += 1
-                prog_bar.progress(done["n"] / total_steps)
-                prog_caption.caption(f"{tkr} ({tf}): {status}")
-
-            with st.spinner("Updating from yfinance…"):
-                try:
-                    update_all(tickers=tickers_to_update, progress=_progress)
-                except Exception as e:
-                    st.error(f"Update failed: {e}")
-                else:
-                    _cached_ohlcv.clear()
-                    _cached_ohlcv_multi.clear()
-                    _cached_sector_sparklines.clear()
-                    _cached_expression_signals.clear()
-                    st.success("Price data refreshed.")
-                    st.rerun()
+    # ---- Single "How to read Self-check" expander — once per tab, not per sector ----
+    with st.expander("How to read the Self-check column"):
+        cutoff_pct = PARAMS.extension_pct_cutoff * 100
+        st.markdown(
+            f"""
+- **CONFIRMED** — Parent is NEW_BUY/HOLD_IF_LONG, the expression is above its
+  own SMA200, its 3-month return ≥ the parent's, and its own extension is
+  within the beta-scaled cutoff ({cutoff_pct:.0f}% × β). Safe participating vehicle.
+- **LAGGING** — Parent BUY-class, expression up-trending and not extended, but
+  3-month return < parent's. Vehicle is rising slower than the sector — pick a
+  different expression.
+- **STRETCHED** — Parent BUY-class, above own SMA200, but own extension >
+  beta-scaled cutoff ({cutoff_pct:.0f}% × β). Too far above its own trend; wait.
+- **BROKEN** — Parent BUY-class, but price < own SMA200. The vehicle is in
+  its own downtrend regardless of the sector — avoid.
+- **WARMING_UP** — Fewer than {PARAMS.sma_window} daily bars stored; SMA200
+  not computable yet.
+- **PARENT_INACTIVE** — Parent sector is not in NEW_BUY/HOLD_IF_LONG. No
+  expression-level call — defer to the parent signal.
+- **NO_DATA** — No price data stored for this ticker. Hit *🔄 Update price data*.
+"""
+        )
 
     # Reuse the cached bundle (raw signals are derived from it; refine_signals
     # adds the `state` column but leaves the underlying `signal` column intact).
     signals = _cached_signals_bundle(date.today().isoformat())
 
     buys = signals.index[signals["signal"] == "BUY"].tolist()
-    if not buys:
-        st.info("No BUY signals at the moment. The full expression map is shown below for reference.")
-        sectors_to_show = list(EXPRESSIONS.keys())
+    buy_class_sectors = signals.index[
+        signals["state"].isin({"NEW_BUY", "HOLD_IF_LONG"})
+    ].tolist()
+
+    show_only_buys = st.session_state.get("exp_show_only_buys", False)
+
+    if show_only_buys:
+        sectors_to_show = buy_class_sectors
+        if not sectors_to_show:
+            st.info(
+                "No BUY/HOLD_IF_LONG sectors right now — toggle off to see the full map."
+            )
     else:
-        st.success(f"BUY signals: {', '.join(buys)}")
-        sectors_to_show = buys + [s for s in EXPRESSIONS if s not in buys]
+        if not buys:
+            st.info("No BUY signals at the moment. The full expression map is shown below for reference.")
+        sectors_to_show = (
+            buy_class_sectors
+            + [s for s in EXPRESSIONS if s not in buy_class_sectors]
+        )
 
     today_iso = date.today().isoformat()
     for sector in sectors_to_show:
-        is_buy = sector in buys
-        prefix = "🟢" if is_buy else "⚪"
-        with st.expander(f"{prefix} {sector} — {SECTOR_ETFS[sector]}", expanded=is_buy):
+        is_buy_class = sector in buy_class_sectors
+        prefix = "🟢" if is_buy_class else "⚪"
+        with st.expander(f"{prefix} {sector} — {SECTOR_ETFS[sector]}", expanded=is_buy_class):
             spark_closes = _cached_sector_sparklines(sector, today_iso)
             missing = [t for t, vals in spark_closes.items() if not vals]
             if missing:
@@ -985,10 +1049,15 @@ with tab_expressions:
             exp_sigs = _cached_expression_signals(sector, parent_state, today_iso)
             sig_by_ticker = {d["ticker"]: d for d in exp_sigs}
 
+            # Only include the Note column when at least one expression in
+            # this sector has a non-empty note — avoids a blank column for
+            # sectors that haven't been annotated yet.
+            has_notes = any(e.note for e in EXPRESSIONS[sector])
+
             rows = []
             for e in EXPRESSIONS[sector]:
                 s = sig_by_ticker.get(e.ticker, {"state": "NO_DATA", "reason": ""})
-                rows.append({
+                row = {
                     "Ticker": e.ticker,
                     "Label": e.label,
                     "Kind": e.kind.replace("_", " "),
@@ -996,11 +1065,15 @@ with tab_expressions:
                     "60d": spark_closes.get(e.ticker, []),
                     "Self-check": s["state"],
                     "Self-check reason": s["reason"],
-                    "Note": e.note,
-                })
+                }
+                if has_notes:
+                    row["Note"] = e.note
+                rows.append(row)
             df_rows = pd.DataFrame(rows)
             column_order = ["Ticker", "Label", "Kind", "β hint", "60d",
-                            "Self-check", "Self-check reason", "Note"]
+                            "Self-check", "Self-check reason"]
+            if has_notes:
+                column_order.append("Note")
             df_rows = df_rows[column_order]
 
             def _style_selfcheck(col: pd.Series) -> list[str]:
@@ -1034,28 +1107,6 @@ with tab_expressions:
                     ),
                 },
             )
-
-            with st.expander("How to read the Self-check column"):
-                cutoff_pct = PARAMS.extension_pct_cutoff * 100
-                st.markdown(
-                    f"""
-- **CONFIRMED** — Parent is NEW_BUY/HOLD_IF_LONG, the expression is above its
-  own SMA200, its 3-month return ≥ the parent's, and its own extension is
-  within the beta-scaled cutoff ({cutoff_pct:.0f}% × β). Safe participating vehicle.
-- **LAGGING** — Parent BUY-class, expression up-trending and not extended, but
-  3-month return < parent's. Vehicle is rising slower than the sector — pick a
-  different expression.
-- **STRETCHED** — Parent BUY-class, above own SMA200, but own extension >
-  beta-scaled cutoff ({cutoff_pct:.0f}% × β). Too far above its own trend; wait.
-- **BROKEN** — Parent BUY-class, but price < own SMA200. The vehicle is in
-  its own downtrend regardless of the sector — avoid.
-- **WARMING_UP** — Fewer than {PARAMS.sma_window} daily bars stored; SMA200
-  not computable yet.
-- **PARENT_INACTIVE** — Parent sector is not in NEW_BUY/HOLD_IF_LONG. No
-  expression-level call — defer to the parent signal.
-- **NO_DATA** — No price data stored for this ticker. Hit *🔄 Update price data*.
-"""
-                )
 
             # ---- click-through full chart ----
             # Selectbox is the sole driver: picking a ticker renders the chart
