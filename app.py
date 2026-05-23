@@ -308,21 +308,25 @@ with tab_dashboard:
         # the row and decide.
         held_sectors: set[str] = set()
         nlv: float | None = None
+        current_value_by_sector: dict[str, float] = {}
         if tiger_configured():
             try:
                 _snap = _cached_tiger_snapshot()
                 nlv = float(_snap.net_liquidation) if _snap.net_liquidation else None
                 from src.tiger_client import compute_drift_by_sector as _cds
                 _drift_for_held = _cds(_snap, targets)
+                current_value_by_sector = {
+                    s: float(v) for s, v in _drift_for_held["current_value"].items()
+                }
                 held_sectors = {
-                    s for s, v in _drift_for_held["current_value"].items()
-                    if float(v) > 0
+                    s for s, v in current_value_by_sector.items() if v > 0
                 }
             except Exception:
                 # Tiger configured but the snapshot fetch blew up — fall back
                 # to "all sectors potentially held" so SELL rows still render.
                 held_sectors = set(SECTOR_ETFS.keys())
                 nlv = None
+                current_value_by_sector = {}
         else:
             held_sectors = set(SECTOR_ETFS.keys())
 
@@ -334,7 +338,8 @@ with tab_dashboard:
             # We treat REDUCE as a sell-class trim; SELL is a hard exit.
             if state in ("SELL", "REDUCE") and tkr in held_sectors:
                 vehicle = _cached_top_vehicle(tkr, state, today_iso)
-                size = "—"  # we don't size sells from targets; user picks
+                cv = current_value_by_sector.get(tkr, 0.0)
+                size = f"${cv:,.0f}" if cv > 0 else "—"
                 conv = _format_conviction(int(row.get("conviction", 0)))
                 why = f"{row['state_reason']}   {conv}"
                 orders_rows.append({
@@ -462,8 +467,11 @@ with tab_dashboard:
         _macro_help = (
             "Tailwinds / (tailwinds + headwinds) across the macro indicators "
             "mapped to each sector (T10Y2Y, HY OAS, UST10, REAL_10Y, "
-            "BREAKEVEN_5Y5Y, DXY, VIX, GOLD_OIL, COPPER_GOLD). Green ≥ 5/8, "
-            "amber 3/8–5/8, red < 3/8. '—' = no relevant readings counted."
+            "BREAKEVEN_5Y5Y, DXY, VIX, GOLD_OIL, COPPER_GOLD). Neutral "
+            "readings are excluded from the denominator, so denominators "
+            "differ between sectors. Color tint reflects the ratio: green "
+            "≥ 0.625, amber 0.375–0.625, red < 0.375. '—' = no relevant "
+            "readings counted."
         )
 
         styled = view.style.apply(_signal_row_style_with_macro, axis=1)
@@ -479,7 +487,9 @@ with tab_dashboard:
                 "Conviction": st.column_config.TextColumn(
                     "Conviction", width="small",
                     help=("0–5 score: +1 each for RS>0, RS>strong, sentiment "
-                          "strong, ≥2 weeks BUY, macro tailwinds ≥ headwinds."),
+                          "strong, ≥2 weeks BUY, macro tailwinds ≥ headwinds. "
+                          "Macro contributes 0 when macro data is unavailable "
+                          "— practical max is 4 in that case."),
                 ),
                 "Sentiment":  st.column_config.TextColumn(
                     "Sentiment", width="small",
