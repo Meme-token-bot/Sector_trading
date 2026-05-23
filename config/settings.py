@@ -71,6 +71,9 @@ class SignalParams:
     stale_buy_weeks: int = 4
     # How many weekly snapshots to replay for state classification
     history_weeks: int = 12
+    # Conviction scoring: relative_strength_3m must exceed this margin
+    # (in decimal form, e.g. 0.03 = 3%) to earn the "strong RS" point.
+    strong_rs_margin: float = 0.03
 
 PARAMS = SignalParams()
 

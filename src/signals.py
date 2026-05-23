@@ -18,6 +18,20 @@ def build_signals(metrics: pd.DataFrame,
         df["sentiment_score"] = df["sentiment_score"].fillna(0.0)
         df["n_obs"] = df["n_obs"].fillna(0).astype(int)
 
+    # Sentiment-quality diagnostics (appended; never reordered). When the
+    # sentiment frame doesn't carry these columns (older callers / empty
+    # frame) we default to safe values: stdev 0, extremes NaN.
+    import numpy as np
+    for col, default in (("score_stdev", 0.0),
+                         ("score_min",   np.nan),
+                         ("score_max",   np.nan)):
+        if not sentiment.empty and col in sentiment.columns:
+            df[col] = sentiment[col].reindex(df.index)
+            if col == "score_stdev":
+                df[col] = df[col].fillna(0.0).astype(float)
+        else:
+            df[col] = default
+
     max_rank = df["rs_rank"].max()
     weak_threshold = max(max_rank - PARAMS.weak_rs_rank_cutoff + 1, 1)
 
@@ -68,7 +82,8 @@ def build_signals(metrics: pd.DataFrame,
 
 
 def refine_signals(signals: pd.DataFrame,
-                   history: pd.DataFrame | None = None) -> pd.DataFrame:
+                   history: pd.DataFrame | None = None,
+                   macro_alignment: pd.DataFrame | None = None) -> pd.DataFrame:
     """Add a state-aware `state` column on top of the raw `signal`.
 
     States:
@@ -146,6 +161,32 @@ def refine_signals(signals: pd.DataFrame,
 
     out["state"] = states
     out["state_reason"] = state_reasons
+
+    # ----- Conviction score (0..5; 0..4 when no macro frame supplied) -----
+    # Each component contributes at most +1. Macro alignment is optional —
+    # when absent the component scores 0 and the practical max is 4.
+    convictions: list[int] = []
+    for tkr, row in out.iterrows():
+        score = 0
+        rs3 = float(row.get("relative_strength_3m", 0.0) or 0.0)
+        if rs3 > 0:
+            score += 1
+        if rs3 > PARAMS.strong_rs_margin:
+            score += 1
+        sent = float(row.get("sentiment_score", 0.0) or 0.0)
+        if sent >= PARAMS.buy_sentiment_threshold + 1:
+            score += 1
+        n_buy = int(row.get("consecutive_buy_weeks", 0) or 0)
+        if n_buy >= 2:
+            score += 1
+        if macro_alignment is not None and not macro_alignment.empty:
+            if tkr in macro_alignment.index:
+                ratio = float(macro_alignment.loc[tkr, "ratio"] or 0.0)
+                if ratio >= 0.5:
+                    score += 1
+        convictions.append(score)
+
+    out["conviction"] = convictions
     return out
 
 
