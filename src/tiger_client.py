@@ -84,7 +84,12 @@ def compute_drift(snapshot: AccountSnapshot,
 
 
 def compute_drift_by_sector(snapshot: AccountSnapshot,
-                            targets: pd.Series) -> pd.DataFrame:
+                            targets: pd.Series,
+                            *,
+                            signals: pd.DataFrame | None = None,
+                            sma200_by_sector: dict[str, float] | None = None,
+                            prices_by_sector: dict[str, float] | None = None,
+                            ) -> pd.DataFrame:
     """Drift accounting that rolls expression holdings up to their signal sector.
 
     A position in GDX is counted toward the XLB sector target. Cash and
@@ -96,6 +101,21 @@ def compute_drift_by_sector(snapshot: AccountSnapshot,
     not part of the equal-weight allocation. Their current value is
     stashed in ``df.attrs["supplementary"]`` as a ``{sector: value}`` dict
     so the UI can surface them in a separate row without a drift target.
+
+    Optional joins:
+      * ``signals`` — a refined-signals frame (must contain a ``state``
+        column keyed by sector ticker). When provided, a ``state`` column
+        is left-joined onto each drift row. Missing sectors get ``"—"``.
+      * ``sma200_by_sector`` — ``{sector_ticker: sma200_value}``. Emits a
+        ``stop_at`` column with the parent sector ETF's SMA200. Missing
+        entries become ``NaN``.
+      * ``prices_by_sector`` — ``{sector_ticker: last_price}``. Emits a
+        ``current_price`` column the UI uses to render the stop-at delta
+        string. Missing entries become ``NaN``.
+
+    Sort order is preserved as before (``trade_value`` desc) so the
+    underlying frame stays stable / sector-keyed. The UI layer can
+    re-sort (e.g. by urgency: SELL → REDUCE → BUY/HOLD).
     """
     from config.expressions import sector_for_ticker
     from config.settings import SECTOR_ETFS, SUPPLEMENTARY_SECTORS
@@ -136,6 +156,20 @@ def compute_drift_by_sector(snapshot: AccountSnapshot,
         "current_value": current_val,
         "trade_value": target_val - current_val,
     }).sort_values("trade_value", ascending=False)
+
+    # Optional state column from refined signals.
+    if signals is not None and "state" in signals.columns:
+        df["state"] = signals["state"].reindex(df.index).fillna("—")
+
+    # Optional stop-at (sector ETF SMA200) column.
+    if sma200_by_sector is not None:
+        df["stop_at"] = pd.Series(sma200_by_sector).reindex(df.index)
+
+    # Optional current-price column (used by the UI to render the
+    # "current → stop (delta%)" string). Kept separate from stop_at so
+    # the API stays composable.
+    if prices_by_sector is not None:
+        df["current_price"] = pd.Series(prices_by_sector).reindex(df.index)
 
     df.attrs["unmapped"] = unmapped
     df.attrs["supplementary"] = supplementary
