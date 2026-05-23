@@ -125,3 +125,134 @@ from src.signal_history import detect_state_changes, signal_performance_vs_bench
 - 30 new tests added across the three new files; baseline 16 still
   green. Final count: **46 passed**.
 - Run: `PYTHONPATH=. pytest tests/ -q`.
+
+
+## Agent DASH — Dashboard Left Pane (branch: worktree-agent-aba14a5590e8b3626)
+
+Phase-2 UI pass that consumes SIG's new compute outputs and re-flows the
+Dashboard tab's left column to surface the actionable insights first.
+The Tiger drift right pane (Agent DRIFT) and the Expressions tab (Agent
+EXP) are untouched.
+
+### Deliverables shipped
+
+1. **"This Week's Orders" panel** — new top-of-tab `section()` rendering
+   a one-row-per-action DataFrame.
+   - SELL rows fire for sectors in `SELL` or `REDUCE` state when Tiger
+     says they're currently held.  Without Tiger configured, every
+     sector is treated as "potentially held" so the row still renders
+     for the user to triage.
+   - BUY rows fire for `NEW_BUY` only (CHASE and HOLD_IF_LONG are
+     deliberately omitted per spec — mature trends mean no fresh entry).
+     Dollar size = `targets[sector] * tiger_nlv` when Tiger is wired,
+     `—` otherwise.
+   - Vehicle column picks the top **CONFIRMED** expression for the
+     sector via `compute_expressions_for_sector`, falling back to the
+     sector ETF itself.
+   - Why column = `state_reason` plus the 5-dot conviction badge.
+   - Empty state: `st.success("No actions this week — portfolio aligned.")`.
+
+2. **Conviction column** in the main matrix, between `Wks BUY` and
+   `Sentiment`.  Rendered via `_format_conviction(n)` as `●●●○○`-style
+   5-dot scale.  `column_config.TextColumn(width="small", help=...)`
+   matching the spec.
+
+3. **Macro alignment pill** between `State` and `Why`.  Cell text =
+   `5/8 ✓` (tailwinds / total_counted).  Color-tinted via the row
+   styler:
+   - green ≥ 5/8 (0.625)
+   - amber 3/8–5/8 (0.375–0.625)
+   - red < 3/8 (0.375)
+   - neutral grey for `—` when nothing is counted.
+   `compute_macro_alignment(...)` is called once on the cached macro
+   bundle (`_cached_macro_bundle`) and the result is passed both into
+   `refine_signals` (for the conviction macro component) and to the
+   matrix renderer.
+
+4. **State-change strip** between the orders panel and the matrix:
+   `st.info("XLE: BUY → NEW_BUY (RS turned positive)  ·  ...")`.
+   Hidden entirely when `detect_state_changes` returns an empty frame.
+
+5. **Performance feedback strip** directly below the State Distribution
+   metrics: `st.caption("NEW_BUY signals, last 12 weeks: hit rate
+   42%, mean excess return +0.8% vs SPY (n=17)")` when the backtest has
+   data, or the explicit "Performance stats unavailable — need ≥4 weeks
+   of history." message when `n_signals == 0` (which the backtest
+   short-circuits on history shorter than 4 weeks).
+
+6. **Sentiment cell** rewritten in place: was `+2.1 (n=3)`, now
+   `+2.1 · n=3 · σ=0.8` (mean · count · stdev).  No backwards-compat
+   shim — replaces the old formatter outright per spec.
+
+7. **Structured Why cell** for BUY-class rows (`NEW_BUY`,
+   `HOLD_IF_LONG`): `📈 +4.2%   📊 +6.1%   💬 +3.4` (RS, extension,
+   sentiment).  CHASE / REDUCE / HOLD / SELL rows keep their prose
+   `state_reason`.  The previous `Action` column was renamed to `Why`
+   so the word "Action" is now exclusively owned by the orders panel
+   above the matrix.
+
+### New cached helpers (additive, follow existing `@st.cache_data` pattern)
+
+- `_cached_macro_bundle()` — `dict[str, MacroPayload]` keyed by the
+  logical names `compute_macro_alignment` expects.  6h TTL.  Shared
+  between the Dashboard and could be reused by future callers; the
+  Macro tab is deliberately left calling the individual fetchers so its
+  layout is not perturbed.
+- `_cached_macro_alignment_frame()` — wraps `compute_macro_alignment`.
+- `_cached_top_vehicle(sector, parent_state, as_of_iso)` — runs
+  `compute_expressions_for_sector` and returns the first `CONFIRMED`
+  ticker, falling back to the sector ETF.  10-minute TTL (same as
+  expression signals).
+- `_cached_signal_performance(as_of_iso)` — wraps
+  `signal_performance_vs_benchmark` for the trailing-12-weeks
+  aggregates.  Adapts the `DataFrame` returned by `_cached_prices()`
+  into the `dict[ticker -> Series]` interface the backtest expects.
+
+### New formatters (in `app.py`)
+
+- `_format_conviction(n: int) -> str` — clamped 0..5, returns
+  `"●●●○○"`-style 5-dot string.
+- `_format_macro_pill(row) -> str` — `"5/8 ✓"` or `"—"`.
+- `_macro_pill_color(row) -> str` — CSS color string for the row
+  styler.
+- `_structured_why(row) -> str` — `📈 / 📊 / 💬` triplet for BUY-class
+  rows.
+
+### Files changed
+- `app.py` — only the Dashboard tab's left column body (and the
+  `_cached_signals_bundle` helper in the Price Action tab section,
+  updated to pass `macro_alignment=` so the conviction score it returns
+  matches what the Dashboard shows).  No changes to the Tiger right
+  pane, no changes to any other tab body.
+- `CLARITY_CHANGES.md` — this section.
+
+### Deviations from spec
+- **Orders panel — REDUCE treated as a SELL-class action.** The spec
+  says "SELL rows: sectors that flipped to SELL or REDUCE this week",
+  and Tiger gate behavior for both.  REDUCE is treated as a SELL row
+  rather than its own action class because the user-facing rendering
+  is identical (`🔴 SELL XLF`) and the `state_reason` carries the
+  "trim if owned" nuance.  This matches the spec's stated intent.
+- **Held-sector inference when Tiger errors out.** If
+  `tiger_configured()` is True but the snapshot fetch raises, the
+  panel falls back to "all sectors potentially held" so SELL rows
+  still render — better to over-suggest than to silently swallow a
+  SELL when the user actually owns the position.
+- **State-change strip arrow.** The spec example uses `→` (which I
+  preserved); the join separator is `  ·  ` (two spaces around a
+  middot) to match the spec's example formatting verbatim.
+- **Macro tooltip is one generic string, not per-cell.** Per the
+  spec's note "One generic help string is fine if per-cell tooltips
+  are awkward" — Streamlit's `column_config` doesn't let us inject
+  per-row help, so a generic explanation enumerating the indicator
+  pool is attached to the column header.
+- **No new `src/ui_tokens.py` additions.** The formatters needed are
+  one-liners specific to the dashboard cells and were kept local to
+  `app.py` rather than promoted into `ui_tokens.py` — there is no
+  second caller that would benefit from sharing them.
+
+### Tests
+- All 46 baseline tests still pass.  No new tests added — every
+  deliverable here is pure presentation (formatters + Streamlit
+  rendering) that consumes SIG's already-tested compute layer.
+- Run: `PYTHONPATH=. pytest tests/ -q`.
