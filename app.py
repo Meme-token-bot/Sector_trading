@@ -1399,6 +1399,10 @@ def _cached_expression_signals(
             "ticker": s.ticker,
             "state": s.state,
             "reason": s.reason,
+            # Exposed for the Band column. Both are None when SMA200 isn't
+            # computable (NO_DATA / WARMING_UP); the renderer falls back to "—".
+            "own_extension_pct": s.own_extension_pct,
+            "beta_scaled_cutoff": s.beta_scaled_cutoff,
         }
         for s in sigs
     ]
@@ -1596,10 +1600,25 @@ with tab_expressions:
         )
 
     # ---- Single "How to read Self-check" expander — once per tab, not per sector ----
-    with st.expander("How to read the Self-check column"):
+    with st.expander("How to read the Band and Self-check columns"):
         cutoff_pct = PARAMS.extension_pct_cutoff * 100
         st.markdown(
             f"""
+**Band column — the entry zone**
+
+`floor → ceiling` is the price range where the vehicle is neither broken nor
+overextended. The Self-check uses these exact numbers:
+
+- **BROKEN floor** = SMA200 of the expression. Price closing below this flips
+  Self-check to BROKEN.
+- **STRETCHED ceiling** = SMA200 × (1 + {cutoff_pct:.0f}% × `β hint`). Price
+  closing above this flips Self-check to STRETCHED.
+
+Shown as `"—"` for tickers with fewer than {PARAMS.sma_window} stored bars
+(SMA200 not computable).
+
+**Self-check states**
+
 - **CONFIRMED** — Parent is NEW_BUY/HOLD_IF_LONG, the expression is above its
   own SMA200, its 3-month return ≥ the parent's, and its own extension is
   within the beta-scaled cutoff ({cutoff_pct:.0f}% × β). Safe participating vehicle.
@@ -1678,12 +1697,28 @@ with tab_expressions:
             rows = []
             for e in EXPRESSIONS[sector]:
                 s = sig_by_ticker.get(e.ticker, {"state": "NO_DATA", "reason": ""})
+                # Entry-zone Band: BROKEN floor (SMA200) → STRETCHED ceiling
+                # (SMA200 × (1 + extension_pct_cutoff × beta_hint)). SMA200 is
+                # back-derived from the last close and own_extension_pct that
+                # the self-check already computed; "—" when not available.
+                ext = s.get("own_extension_pct")
+                bsc = s.get("beta_scaled_cutoff")
+                spark = spark_closes.get(e.ticker, [])
+                if (ext is not None and bsc is not None
+                        and spark and (1.0 + ext) != 0):
+                    last_px = float(spark[-1])
+                    sma200 = last_px / (1.0 + ext)
+                    ceiling = sma200 * (1.0 + bsc)
+                    band_str = f"${sma200:,.2f} → ${ceiling:,.2f}"
+                else:
+                    band_str = "—"
                 row = {
                     "Ticker": e.ticker,
                     "Label": e.label,
                     "Kind": e.kind.replace("_", " "),
                     "β hint": f"{e.beta_hint:.2f}x",
-                    "60d": spark_closes.get(e.ticker, []),
+                    "60d": spark,
+                    "Band": band_str,
                     "Self-check": s["state"],
                     "Self-check reason": s["reason"],
                 }
@@ -1692,7 +1727,7 @@ with tab_expressions:
                 rows.append(row)
             df_rows = pd.DataFrame(rows)
             column_order = ["Ticker", "Label", "Kind", "β hint", "60d",
-                            "Self-check", "Self-check reason"]
+                            "Band", "Self-check", "Self-check reason"]
             if has_notes:
                 column_order.append("Note")
             df_rows = df_rows[column_order]
@@ -1718,6 +1753,15 @@ with tab_expressions:
                     "60d": st.column_config.LineChartColumn(
                         "60d", width="medium",
                         help="Last 60 trading days of daily closes",
+                    ),
+                    "Band": st.column_config.TextColumn(
+                        "Band", width="medium",
+                        help=(
+                            "Entry zone: BROKEN floor (SMA200) → STRETCHED "
+                            "ceiling (SMA200 × (1 + extension_pct_cutoff × β)). "
+                            "Below the floor flips Self-check to BROKEN; above "
+                            "the ceiling flips it to STRETCHED."
+                        ),
                     ),
                     "Self-check": st.column_config.TextColumn(
                         "Self-check", width="small",
