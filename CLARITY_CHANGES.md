@@ -125,3 +125,81 @@ from src.signal_history import detect_state_changes, signal_performance_vs_bench
 - 30 new tests added across the three new files; baseline 16 still
   green. Final count: **46 passed**.
 - Run: `PYTHONPATH=. pytest tests/ -q`.
+
+
+## Agent DRIFT — Tiger Drift Right Pane
+
+Item 5 + item 6 from the Clarity sprint: make the Tiger drift table on
+the Dashboard tab match the language of the main signals matrix and tell
+the user where the exit lives.
+
+### Deliverables
+
+**1. Holding-state column (item 5)**
+- `compute_drift_by_sector` now accepts an optional keyword-only
+  `signals=` (a refined-signals frame with a `state` column). When
+  provided the drift frame gets a `state` column joined by sector
+  ticker. Missing sectors fall back to `"—"`.
+- The Streamlit table renders `State` between `target_weight` and
+  `current_weight`. Each row is tinted using the shared
+  `src.charts.STATE_COLORS` palette via a pandas `Styler.apply` —
+  matches the pattern used by the main signals matrix
+  (`_signal_row_style`).
+
+**2. Urgency sort**
+- `compute_drift_by_sector` still returns `trade_value`-desc so the
+  utility stays stable and sector-keyed (other callers can rely on
+  it). The urgency re-sort lives in `app.py` (UI layer only):
+  SELL (0) → REDUCE (1) → BUY/HOLD (2), with a secondary tiebreak on
+  `abs(trade_value)` desc. Exit decisions float to the top because
+  they're time-sensitive.
+
+**3. Stop-at price column (item 6)**
+- `compute_drift_by_sector` accepts an optional `sma200_by_sector:
+  dict[str, float]`. When provided, the frame gets a `stop_at` column
+  with the parent sector ETF's SMA200.
+- Also accepts an optional `prices_by_sector: dict[str, float]` so
+  the UI can render the full `"$current → $stop (delta%)"` string
+  without re-pulling prices. Both maps gracefully tolerate missing
+  sectors (NaN) and the UI renders those as `"—"`.
+
+**4. Wire from caller (no recomputation)**
+- The Dashboard already builds a `metrics` frame via
+  `compute_sector_metrics(prices)` (which contains `price` and
+  `sma200`). The Tiger pane reuses those cached values directly —
+  `metrics["sma200"].to_dict()` and `metrics["price"].to_dict()` —
+  rather than recomputing the moving averages.
+
+### Files touched
+- `src/tiger_client.py` — extended `compute_drift_by_sector` signature
+  (kw-only `signals=`, `sma200_by_sector=`, `prices_by_sector=`). All
+  new params optional, fully backwards compatible.
+- `app.py` — only the `with right:` Tiger-drift body inside
+  `tab_dashboard`. Left pane, supplementary-sectors sub-table, and
+  unmapped-holdings expander untouched.
+- `tests/test_tiger_drift.py` — new file, 8 tests covering signals
+  join, sma200 join, price join, missing-entry graceful behavior, and
+  the urgency re-sort pattern.
+
+### Decisions / deviations
+- Added an extra optional `prices_by_sector=` param beyond the spec's
+  two. The spec says the UI can pull `current_price` from the drift
+  row "or from `prices`" — but the drift row didn't carry the
+  per-sector price before, and the Dashboard already has the price
+  map from `metrics`. Threading it through the same call site as
+  `sma200_by_sector` keeps the rendering layer trivial and avoids
+  duplicating the price lookup. The default is `None`, so existing
+  callers are unaffected.
+- `stop_at` returns raw float (or NaN) — formatting is the UI's job.
+  The drift utility stays Streamlit-free.
+- State column placeholder is `"—"` (matching the supplementary-row
+  pattern already in app.py at line 327) rather than NaN, so the
+  styler can `_STATE_COLORS.get(state, "")` cleanly without an
+  isna() guard.
+- Urgency sort intentionally lives in the UI layer (per spec).
+  `compute_drift_by_sector` stays sector-key-stable.
+
+### Tests
+- 8 new tests in `tests/test_tiger_drift.py`. Baseline 46 still green.
+  Final count: **54 passed**.
+- Run: `PYTHONPATH=. python3 -m pytest tests/ -q`.

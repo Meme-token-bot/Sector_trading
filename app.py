@@ -296,14 +296,60 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
             try:
                 snap = _cached_tiger_snapshot()
                 from src.tiger_client import compute_drift_by_sector
-                drift = compute_drift_by_sector(snap, targets)
+
+                # Reuse the SMA200 + price values metrics already computed
+                # from the cached price frame above — do not recompute.
+                _sma200_map = (metrics["sma200"].to_dict()
+                               if "sma200" in metrics.columns else {})
+                _price_map = (metrics["price"].to_dict()
+                              if "price" in metrics.columns else {})
+
+                drift = compute_drift_by_sector(
+                    snap, targets,
+                    signals=signals,
+                    sma200_by_sector=_sma200_map,
+                    prices_by_sector=_price_map,
+                )
 
                 t1, t2 = st.columns(2)
                 t1.metric("Net Liq Value", f"${snap.net_liquidation:,.0f}")
                 t2.metric("Cash", f"${snap.cash:,.0f}",
                           delta=f"{snap.cash / snap.net_liquidation:.1%}" if snap.net_liquidation else None)
 
-                show = drift.copy()
+                # Urgency sort: SELL first, then REDUCE, then BUY/HOLD.
+                # Within each group, secondary-sort by abs(trade_value) desc
+                # so the largest dollar moves bubble to the top. Exit
+                # decisions are time-sensitive — they belong at the top.
+                _urgency_rank = {"SELL": 0, "REDUCE": 1}
+                _state_col = drift["state"] if "state" in drift.columns else pd.Series(
+                    "HOLD", index=drift.index
+                )
+                drift_sorted = drift.assign(
+                    _urgency=_state_col.map(lambda s: _urgency_rank.get(s, 2)),
+                    _abs_trade=drift["trade_value"].abs(),
+                ).sort_values(["_urgency", "_abs_trade"],
+                              ascending=[True, False]).drop(
+                    columns=["_urgency", "_abs_trade"]
+                )
+
+                show = drift_sorted.copy()
+
+                # Build the stop-at display column BEFORE we stringify
+                # current_weight / trade_value — it needs the raw price
+                # & stop floats.
+                def _fmt_stop(row: pd.Series) -> str:
+                    stop = row.get("stop_at", float("nan"))
+                    px = row.get("current_price", float("nan"))
+                    if pd.isna(stop) or pd.isna(px) or not px:
+                        return "—"
+                    delta = (stop / px - 1.0) * 100
+                    return f"${px:,.2f} → ${stop:,.2f} ({delta:+.1f}%)"
+
+                if "stop_at" in show.columns:
+                    show["Stop at (SMA200)"] = show.apply(_fmt_stop, axis=1)
+                else:
+                    show["Stop at (SMA200)"] = "—"
+
                 show["target_weight"] = show["target_weight"].map("{:.1%}".format)
                 show["current_weight"] = show["current_weight"].map("{:.1%}".format)
                 show["drift"] = show["drift"].map("{:+.1%}".format)
@@ -311,9 +357,41 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
                     lambda v: f"BUY ${v:,.0f}" if v > 100
                               else (f"SELL ${-v:,.0f}" if v < -100 else "—")
                 )
+
+                # Insert State between target_weight and current_weight.
+                if "state" not in show.columns:
+                    show["state"] = "—"
+                show = show.rename(columns={"state": "State"})
+
+                _cols = ["target_weight", "State", "current_weight",
+                         "drift", "trade_value", "Stop at (SMA200)"]
+
+                # Tint each row by its State value using the shared
+                # STATE_COLORS palette so the drift table matches the
+                # main signals matrix at a glance.
+                def _drift_row_style(row: pd.Series) -> list[str]:
+                    color = _STATE_COLORS.get(row.get("State", ""), "")
+                    return [f"background-color: {color}; color: #eee"
+                            if color else "" for _ in row]
+
+                styled_drift = show[_cols].style.apply(_drift_row_style, axis=1)
                 st.dataframe(
-                    show[["target_weight", "current_weight", "drift", "trade_value"]],
+                    styled_drift,
                     use_container_width=True,
+                    column_config={
+                        "target_weight":    st.column_config.TextColumn("Target",  width="small"),
+                        "State":            st.column_config.TextColumn("State",   width="small"),
+                        "current_weight":   st.column_config.TextColumn("Current", width="small"),
+                        "drift":            st.column_config.TextColumn("Drift",   width="small"),
+                        "trade_value":      st.column_config.TextColumn("Trade",   width="small"),
+                        "Stop at (SMA200)": st.column_config.TextColumn(
+                            "Stop at (SMA200)", width="medium"
+                        ),
+                    },
+                )
+                st.caption(
+                    "Sorted by urgency: SELL → REDUCE → BUY/HOLD, "
+                    "then by trade size. Stop = parent sector ETF SMA200."
                 )
 
                 # Supplementary sectors (e.g. UFO/Space) — tactical overlay
