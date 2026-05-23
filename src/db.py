@@ -122,27 +122,49 @@ def save_analysis(analysis: NewsletterAnalysis, raw_text: str) -> int | None:
 
 def aggregate_sentiment(as_of: date | None = None,
                         lookback_days: int | None = None) -> pd.DataFrame:
+    """Per-ticker rolling sentiment aggregation.
+
+    Returns DataFrame indexed by ticker with columns (in this order):
+      score:       float — mean of per-newsletter sentiment scores
+      n_obs:       int   — count of contributing observations
+      score_stdev: float — population stdev (ddof=0); 0.0 when n_obs < 2
+      score_min:   float — min observed score; NaN when n_obs == 0
+      score_max:   float — max observed score; NaN when n_obs == 0
+    """
     as_of = as_of or date.today()
     lookback = lookback_days or PARAMS.sentiment_lookback_days
     cutoff = as_of - timedelta(days=lookback)
 
+    empty_cols = ["score", "n_obs", "score_stdev", "score_min", "score_max"]
     init_db()
     with _conn() as c:
         df = pd.read_sql_query(
             """
-            SELECT sr.ticker,
-                   AVG(sr.sentiment_score) AS score,
-                   COUNT(*)                AS n_obs
+            SELECT sr.ticker, sr.sentiment_score
             FROM sector_ratings sr
             JOIN newsletters n ON n.id = sr.newsletter_id
             WHERE n.publication_date >= ?
               AND n.publication_date <= ?
-            GROUP BY sr.ticker
             """,
             c, params=(cutoff.isoformat(), as_of.isoformat()),
         )
-    return df.set_index("ticker") if not df.empty else pd.DataFrame(
-        columns=["score", "n_obs"]).rename_axis("ticker")
+    if df.empty:
+        return pd.DataFrame(columns=empty_cols).rename_axis("ticker")
+
+    grouped = df.groupby("ticker")["sentiment_score"]
+    # Population stdev (ddof=0). pandas returns NaN for groups of size 1,
+    # which we coerce to 0.0 per spec.
+    stdev = grouped.std(ddof=0).fillna(0.0)
+    out = pd.DataFrame({
+        "score":       grouped.mean().astype(float),
+        "n_obs":       grouped.size().astype(int),
+        "score_stdev": stdev.astype(float),
+        "score_min":   grouped.min().astype(float),
+        "score_max":   grouped.max().astype(float),
+    })
+    out.index.name = "ticker"
+    # Enforce canonical column order.
+    return out[empty_cols]
 
 
 def recent_newsletters(limit: int = 25) -> pd.DataFrame:
