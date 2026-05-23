@@ -179,7 +179,15 @@ class Allocation(BaseModel):
 
 
 class WeeklyRecap(BaseModel):
-    """Structured response from gpt-4o-mini for the Weekly Recap tab."""
+    """Structured response from gpt-4o-mini for the Weekly Recap tab.
+
+    Field order is deliberate.  Structured-output models fill fields in
+    declaration order, so the per-sector and per-allocation details are
+    decided BEFORE ``weekly_summary`` is written — meaning the summary can
+    legitimately reference what's in the rest of the recap.  The UI then
+    renders ``weekly_summary`` at the TOP for the reader, even though the
+    model wrote it last.
+    """
     generated_for_week_ending: date
     n_newsletters: int
     macro: MacroNarrative
@@ -192,6 +200,18 @@ class WeeklyRecap(BaseModel):
     allocation: list[Allocation] = Field(
         default_factory=list,
         description="Ranked, highest-conviction tilts first.",
+    )
+    weekly_summary: str = Field(
+        ..., max_length=1500,
+        description="The executive summary the reader sees first.  Write "
+                    "this LAST, after macro/sectors/allocation are decided.  "
+                    "6-10 sentences in plain English that tie together: "
+                    "(a) what newsletters said this week, (b) what the macro "
+                    "tape is telling us right now, (c) where you came out on "
+                    "the highest-conviction sector tilts and why, and (d) "
+                    "where the data genuinely conflicts.  Should read as a "
+                    "coherent narrative — not a list of bullet points — and "
+                    "should not contradict any sector or allocation entry.",
     )
     caveats: str = Field(
         ..., max_length=400,

@@ -448,6 +448,13 @@ with tab_recap:
                       recap.generated_for_week_ending.isoformat())
             h3.metric("Regime", recap.macro.regime_label.value)
 
+            # ---- Executive summary (rendered FIRST, written LAST) ----
+            # The lede the reader sees before drilling into per-sector
+            # detail.  The model wrote this after deciding on macro /
+            # sectors / allocation, so it can legitimately reference them.
+            section("📰 This week in one read", level=3)
+            st.markdown(recap.weekly_summary)
+
             # ---- Macro narrative ----
             section("🌐 Macro narrative", level=3)
             st.markdown(recap.macro.summary)

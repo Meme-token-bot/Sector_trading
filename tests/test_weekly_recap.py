@@ -182,6 +182,16 @@ def test_schema_round_trip():
                 rationale="No newsletter signal — hold tactical only.",
             ),
         ],
+        weekly_summary=(
+            "The week tilts late-cycle. Newsletters lean bullish on tech "
+            "while flagging credit-spread widening as the canary. Macro "
+            "supports the tech bid — DXY soft, real yields easing — but "
+            "the inverted curve and quietly stressed HY OAS keep us "
+            "honest. Highest-conviction call is XLK overweight on the "
+            "back of supportive real yields and an unbroken newsletter "
+            "bull thesis. UFO stays equal-weight as a tactical placeholder "
+            "with no coverage this week."
+        ),
         caveats="Informational only. Not personalised investment advice.",
     )
 
@@ -193,6 +203,9 @@ def test_schema_round_trip():
     assert reloaded.sectors[0].newsletter_consensus == NewsletterConsensus.BULLISH
     assert reloaded.sectors[1].newsletter_consensus == NewsletterConsensus.NO_COVERAGE
     assert reloaded.allocation[0].suggested_tilt == AllocationTilt.OVERWEIGHT
+    # weekly_summary is the executive lede — must survive round-trip intact.
+    assert reloaded.weekly_summary == recap.weekly_summary
+    assert "late-cycle" in reloaded.weekly_summary.lower()
 
 
 def test_generate_recap_with_stub_client(temp_db):
@@ -235,6 +248,13 @@ def test_generate_recap_with_stub_client(temp_db):
             Allocation(ticker="XLK", suggested_tilt=AllocationTilt.OVERWEIGHT,
                        rationale="Bullish + supportive macro."),
         ],
+        weekly_summary=(
+            "Mixed tape this week. One newsletter went constructive on "
+            "tech; macro is genuinely split between supportive real yields "
+            "and a still-inverted curve. Highest-conviction call is XLK "
+            "overweight on the strength of the one bullish read and a "
+            "supportive real-yield path."
+        ),
         caveats="Not advice.",
     )
 

@@ -330,7 +330,18 @@ macro read.
 
 Bias: helpful, decisive, but honest about uncertainty. Avoid hedging \
 language ('it depends', 'time will tell') unless the data genuinely \
-conflicts."""
+conflicts.
+
+The `weekly_summary` field is the executive summary the reader sees \
+FIRST in the UI, even though you fill it last in the response. After \
+you've worked through macro, sectors, and allocation, write 6-10 \
+sentences in plain English that tie together: (a) what the newsletters \
+said this week, (b) what the macro tape is telling us right now, (c) \
+where you came out on the highest-conviction sector tilts and the \
+single best reason for each, and (d) where the data genuinely \
+conflicts. Read as a coherent narrative — not a list of bullets — and \
+do not contradict anything in the macro / sectors / allocation \
+sections."""
 
 
 def _format_context_as_markdown(ctx: WeeklyRecapContext) -> str:
