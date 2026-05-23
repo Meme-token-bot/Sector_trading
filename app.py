@@ -130,6 +130,80 @@ def _cached_tiger_snapshot():
     return fetch_account_snapshot()
 
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_macro_bundle() -> dict:
+    """Bundle every macro indicator payload into one dict keyed by the same
+    logical names `compute_macro_alignment` expects.
+
+    Shared between the Dashboard (for the macro-alignment column / conviction
+    component) and the Macro tab (which still calls each fetcher individually
+    for its full per-indicator render).  Keeping this additive — the Macro
+    tab continues to call the underlying fetchers directly so its layout is
+    untouched.
+    """
+    macro_prices = _cached_macro_prices()
+    fred = _cached_fred_indicators()
+    return {
+        "T10Y2Y":         _cached_yield_curve(),
+        "HY_OAS":         fred.get("HY_OAS", {}),
+        "UST10":          fred.get("UST10", {}),
+        "REAL_10Y":       fred.get("REAL_10Y", {}),
+        "BREAKEVEN_5Y5Y": fred.get("BREAKEVEN_5Y5Y", {}),
+        "DXY":            dxy_level(macro_prices),
+        "VIX":            vix_level(macro_prices),
+        "GOLD_OIL":       gold_oil_ratio(macro_prices),
+        "COPPER_GOLD":    copper_gold_ratio(macro_prices),
+    }
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_macro_alignment_frame() -> pd.DataFrame:
+    from src.macro_alignment import compute_macro_alignment
+    return compute_macro_alignment(_cached_macro_bundle())
+
+
+@st.cache_data(ttl=10 * 60, show_spinner=False)
+def _cached_top_vehicle(sector: str, parent_state: str,
+                        as_of_iso: str) -> str:
+    """Top CONFIRMED expression ticker for a sector, falling back to the
+    sector ETF itself.  Used by the orders panel to pick the actual buy
+    vehicle for a NEW_BUY sector (or the sell vehicle when reducing).
+    """
+    warmup_start = date.fromisoformat(as_of_iso) - timedelta(days=300)
+
+    def _loader(ticker: str) -> pd.Series:
+        df = load_ohlcv(ticker, "1d", start=warmup_start)
+        if df.empty:
+            return pd.Series(dtype=float)
+        return df["close"]
+
+    try:
+        sigs = compute_expressions_for_sector(sector, parent_state, _loader)
+    except Exception:
+        return sector
+    for s in sigs:
+        if s.state == "CONFIRMED":
+            return s.ticker
+    return sector
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_signal_performance(as_of_iso: str) -> dict:
+    """Backtest aggregates for the trailing 12-week BUY snapshots."""
+    from src.signal_history import signal_performance_vs_benchmark
+    prices = _cached_prices()
+    history = _cached_signal_history(as_of_iso)
+    if prices is None or prices.empty:
+        return {"n_signals": 0, "mean_excess_return": 0.0,
+                "hit_rate": 0.0, "by_state": {}}
+    # `prices` is a DataFrame of close columns per ticker — adapt to the
+    # dict[ticker -> Series] interface the backtest expects.
+    price_map = {col: prices[col].dropna() for col in prices.columns}
+    return signal_performance_vs_benchmark(
+        history, price_map, benchmark_ticker=BENCHMARK, weeks=12,
+    )
+
+
 def _signal_row_style(row: pd.Series) -> list[str]:
     state = row.get("State", row.get("state", row.get("Signal", row.get("signal", ""))))
     color = _STATE_COLORS.get(state, "")
@@ -138,6 +212,59 @@ def _signal_row_style(row: pd.Series) -> list[str]:
 
 def _fmt_pct(x: float) -> str:
     return f"{x*100:+.2f}%" if pd.notna(x) else "—"
+
+
+def _format_conviction(n: int) -> str:
+    """Render a 0-5 conviction score as a 5-dot scale: '●●●○○'."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        n = 0
+    n = max(0, min(5, n))
+    return "●" * n + "○" * (5 - n)
+
+
+def _format_macro_pill(row: pd.Series) -> str:
+    """Render a macro-alignment row as 'tailwinds/total ✓' or '—' when no
+    relevant indicators were counted.
+    """
+    if row is None:
+        return "—"
+    tw = int(row.get("tailwinds", 0))
+    hw = int(row.get("headwinds", 0))
+    total = tw + hw
+    if total == 0:
+        return "—"
+    return f"{tw}/{total} ✓"
+
+
+def _macro_pill_color(row: pd.Series) -> str:
+    """CSS color string for the macro pill cell based on the ratio."""
+    if row is None:
+        return ""
+    tw = int(row.get("tailwinds", 0))
+    hw = int(row.get("headwinds", 0))
+    total = tw + hw
+    if total == 0:
+        return "color: #888888"   # neutral grey for "—"
+    ratio = tw / total
+    if ratio >= 0.625:
+        return "color: #2ecc71"   # green
+    if ratio >= 0.375:
+        return "color: #f1c40f"   # amber
+    return "color: #e74c3c"       # red
+
+
+def _structured_why(row: pd.Series) -> str:
+    """Icon-tagged RS · extension · sentiment for BUY-class rows."""
+    rs = row.get("relative_strength_3m")
+    ext = row.get("extension_pct")
+    sent = row.get("sentiment_score")
+    parts = []
+    parts.append(f"📈 {rs*100:+.1f}%"  if pd.notna(rs)   else "📈 —")
+    parts.append(f"📊 {ext*100:+.1f}%" if pd.notna(ext)  else "📊 —")
+    parts.append(f"💬 {sent:+.1f}"     if pd.notna(sent) else "💬 —")
+    return "   ".join(parts)
 
 
 render_header(
@@ -162,40 +289,207 @@ with tab_dashboard:
         sentiment = _cached_sentiment(date.today().isoformat())
         raw_signals = build_signals(metrics, sentiment)
         history = _cached_signal_history(date.today().isoformat())
-        signals = refine_signals(raw_signals, history)
+        macro_alignment = _cached_macro_alignment_frame()
+        signals = refine_signals(raw_signals, history,
+                                 macro_alignment=macro_alignment)
         targets = target_weights(signals)
 
     left, right = st.columns([3, 2], gap="large")
 
     with left:
+        # ====== 1. This Week's Orders =====================================
+        section("This Week's Orders", level=3)
+
+        today_iso = date.today().isoformat()
+
+        # Establish currently-held sectors from Tiger when available, so SELL
+        # rows only fire for things we actually own.  When Tiger is absent,
+        # treat every sector as "potentially held" — the user can still scan
+        # the row and decide.
+        held_sectors: set[str] = set()
+        nlv: float | None = None
+        if tiger_configured():
+            try:
+                _snap = _cached_tiger_snapshot()
+                nlv = float(_snap.net_liquidation) if _snap.net_liquidation else None
+                from src.tiger_client import compute_drift_by_sector as _cds
+                _drift_for_held = _cds(_snap, targets)
+                held_sectors = {
+                    s for s, v in _drift_for_held["current_value"].items()
+                    if float(v) > 0
+                }
+            except Exception:
+                # Tiger configured but the snapshot fetch blew up — fall back
+                # to "all sectors potentially held" so SELL rows still render.
+                held_sectors = set(SECTOR_ETFS.keys())
+                nlv = None
+        else:
+            held_sectors = set(SECTOR_ETFS.keys())
+
+        orders_rows: list[dict] = []
+        for tkr, row in signals.iterrows():
+            state = row["state"]
+
+            # SELL action — sector currently held AND state in SELL/REDUCE.
+            # We treat REDUCE as a sell-class trim; SELL is a hard exit.
+            if state in ("SELL", "REDUCE") and tkr in held_sectors:
+                vehicle = _cached_top_vehicle(tkr, state, today_iso)
+                size = "—"  # we don't size sells from targets; user picks
+                conv = _format_conviction(int(row.get("conviction", 0)))
+                why = f"{row['state_reason']}   {conv}"
+                orders_rows.append({
+                    "Action":  f"🔴 SELL {tkr}",
+                    "Vehicle": vehicle,
+                    "Size":    size,
+                    "Why":     why,
+                })
+                continue
+
+            # BUY action — only fresh NEW_BUY rows. CHASE / HOLD_IF_LONG are
+            # intentionally omitted: extended trends mean no fresh action.
+            if state == "NEW_BUY":
+                vehicle = _cached_top_vehicle(tkr, state, today_iso)
+                if nlv is not None and tkr in targets.index:
+                    dollars = float(targets.loc[tkr]) * nlv
+                    size = f"${dollars:,.0f}"
+                else:
+                    size = "—"
+                conv = _format_conviction(int(row.get("conviction", 0)))
+                why = f"{row['state_reason']}   {conv}"
+                orders_rows.append({
+                    "Action":  f"🟢 BUY {tkr}",
+                    "Vehicle": vehicle,
+                    "Size":    size,
+                    "Why":     why,
+                })
+
+        if not orders_rows:
+            st.success("No actions this week — portfolio aligned.")
+        else:
+            orders_df = pd.DataFrame(orders_rows)
+            st.dataframe(
+                orders_df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Action":  st.column_config.TextColumn("Action",  width="small"),
+                    "Vehicle": st.column_config.TextColumn("Vehicle", width="small"),
+                    "Size":    st.column_config.TextColumn("Size",    width="small"),
+                    "Why":     st.column_config.TextColumn("Why",     width="large"),
+                },
+            )
+
+        # ====== 2. State-change strip =====================================
+        from src.signal_history import detect_state_changes
+        try:
+            changes = detect_state_changes(history, signals)
+        except Exception:
+            changes = pd.DataFrame()
+        if changes is not None and not changes.empty:
+            _change_strs = [
+                f"{r['sector']}: {r['prior_state']} → {r['new_state']} ({r['reason']})"
+                for _, r in changes.iterrows()
+            ]
+            st.info("  ·  ".join(_change_strs))
+
+        # ====== 3. Sector Relative Strength Matrix ========================
         section("Sector Relative Strength Matrix", level=3)
 
         display = signals.copy()
-        display["3M vs SPY"] = display["relative_strength_3m"].map(_fmt_pct)
+        display["3M vs SPY"]  = display["relative_strength_3m"].map(_fmt_pct)
         display["Ext vs SMA"] = display["extension_pct"].map(_fmt_pct)
-        display["Wks BUY"] = display["consecutive_buy_weeks"].astype(int)
+        display["Wks BUY"]    = display["consecutive_buy_weeks"].astype(int)
+        # Conviction dots and macro alignment pill -- pre-format the columns.
+        display["Conviction"] = display["conviction"].map(_format_conviction)
+
+        # Macro alignment pill (cell text + color)
+        def _macro_for(tkr: str) -> pd.Series:
+            if (macro_alignment is not None
+                    and not macro_alignment.empty
+                    and tkr in macro_alignment.index):
+                return macro_alignment.loc[tkr]
+            return None  # type: ignore[return-value]
+
+        display["Macro"] = display.index.map(
+            lambda t: _format_macro_pill(_macro_for(t))
+        )
+        _macro_color_by_ticker = {
+            t: _macro_pill_color(_macro_for(t)) for t in display.index
+        }
+
+        # New Sentiment format: '+2.1 · n=3 · σ=0.8'
         display["Sentiment"] = display.apply(
-            lambda r: f"{r['sentiment_score']:+.1f} (n={int(r['n_obs'])})", axis=1
+            lambda r: (
+                f"{r['sentiment_score']:+.1f} · n={int(r['n_obs'])} · "
+                f"σ={float(r['score_stdev']):.1f}"
+            ),
+            axis=1,
+        )
+
+        # Structured Why for BUY-class rows; prose for everything else.
+        _buy_class = {"NEW_BUY", "HOLD_IF_LONG"}
+        display["Why"] = display.apply(
+            lambda r: (_structured_why(r)
+                       if r["state"] in _buy_class
+                       else r["state_reason"]),
+            axis=1,
         )
 
         view = display[["name", "3M vs SPY", "Ext vs SMA", "Wks BUY",
-                        "Sentiment", "state", "state_reason"]].rename(
-            columns={"name": "Sector", "state": "State", "state_reason": "Action"}
+                        "Conviction", "Sentiment", "state", "Macro",
+                        "Why"]].rename(
+            columns={"name": "Sector", "state": "State"}
         )
 
-        styled = view.style.apply(_signal_row_style, axis=1)
+        # Macro-aware row styler: keep state-driven row tint AND tint the
+        # Macro cell text by ratio band.  `_signal_row_style` already paints
+        # the row background; we override the Macro cell's color attribute.
+        def _signal_row_style_with_macro(row: pd.Series) -> list[str]:
+            base = _signal_row_style(row)
+            # Find the index of the Macro column to override its color.
+            try:
+                macro_idx = list(row.index).index("Macro")
+            except ValueError:
+                return base
+            extra = _macro_color_by_ticker.get(row.name, "")
+            if extra:
+                # Append to whatever the row style produced; CSS later-wins.
+                base[macro_idx] = (base[macro_idx] + "; " + extra).strip("; ")
+            return base
+
+        # One generic help string for the Macro column — per-cell tooltips
+        # are awkward in column_config, so the per-sector indicator detail
+        # is exposed through the alignment frame and surfaced here as a
+        # general explanation.
+        _macro_help = (
+            "Tailwinds / (tailwinds + headwinds) across the macro indicators "
+            "mapped to each sector (T10Y2Y, HY OAS, UST10, REAL_10Y, "
+            "BREAKEVEN_5Y5Y, DXY, VIX, GOLD_OIL, COPPER_GOLD). Green ≥ 5/8, "
+            "amber 3/8–5/8, red < 3/8. '—' = no relevant readings counted."
+        )
+
+        styled = view.style.apply(_signal_row_style_with_macro, axis=1)
         st.dataframe(
             styled,
             use_container_width=True,
             height=460,
             column_config={
-                "Sector":    st.column_config.TextColumn("Sector",    width="medium"),
-                "3M vs SPY": st.column_config.TextColumn("3M vs SPY", width="small"),
-                "Ext vs SMA":st.column_config.TextColumn("Ext vs SMA",width="small"),
-                "Wks BUY":   st.column_config.NumberColumn("Wks BUY", width="small"),
-                "Sentiment": st.column_config.TextColumn("Sentiment", width="small"),
-                "State":     st.column_config.TextColumn("State",     width="small"),
-                "Action":    st.column_config.TextColumn("Action",    width="large"),
+                "Sector":     st.column_config.TextColumn("Sector",     width="medium"),
+                "3M vs SPY":  st.column_config.TextColumn("3M vs SPY",  width="small"),
+                "Ext vs SMA": st.column_config.TextColumn("Ext vs SMA", width="small"),
+                "Wks BUY":    st.column_config.NumberColumn("Wks BUY",  width="small"),
+                "Conviction": st.column_config.TextColumn(
+                    "Conviction", width="small",
+                    help=("0–5 score: +1 each for RS>0, RS>strong, sentiment "
+                          "strong, ≥2 weeks BUY, macro tailwinds ≥ headwinds."),
+                ),
+                "Sentiment":  st.column_config.TextColumn(
+                    "Sentiment", width="small",
+                    help="Mean score · # newsletters reviewed · stdev across them.",
+                ),
+                "State":      st.column_config.TextColumn("State",      width="small"),
+                "Macro":      st.column_config.TextColumn(
+                    "Macro", width="small", help=_macro_help,
+                ),
+                "Why":        st.column_config.TextColumn("Why",        width="large"),
             },
         )
 
@@ -206,6 +500,22 @@ with tab_dashboard:
             ["NEW_BUY", "HOLD_IF_LONG", "CHASE", "REDUCE", "HOLD", "SELL"],
         ):
             col.metric(state, int((signals["state"] == state).sum()))
+
+        # ====== 5. Performance feedback strip =============================
+        try:
+            perf = _cached_signal_performance(today_iso)
+        except Exception:
+            perf = {"n_signals": 0, "mean_excess_return": 0.0,
+                    "hit_rate": 0.0}
+        if perf["n_signals"] == 0:
+            st.caption("Performance stats unavailable — need ≥4 weeks of history.")
+        else:
+            st.caption(
+                f"NEW_BUY signals, last 12 weeks: hit rate "
+                f"{perf['hit_rate']*100:.0f}%, mean excess return "
+                f"{perf['mean_excess_return']*100:+.1f}% vs {BENCHMARK} "
+                f"(n={perf['n_signals']})"
+            )
 
         _has_buy_signals = not targets.empty
         with st.expander(
@@ -1104,7 +1414,9 @@ def _cached_signals_bundle(as_of_iso: str) -> pd.DataFrame:
     sentiment = _cached_sentiment(as_of_iso)
     raw_signals = build_signals(metrics, sentiment)
     history = _cached_signal_history(as_of_iso)
-    return refine_signals(raw_signals, history)
+    macro_alignment = _cached_macro_alignment_frame()
+    return refine_signals(raw_signals, history,
+                          macro_alignment=macro_alignment)
 
 
 with tab_price:
