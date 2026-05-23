@@ -158,11 +158,19 @@ def target_weights(signals: pd.DataFrame, cash_buffer: float = 0.05) -> pd.Serie
     don't enter from cash.
 
     Otherwise falls back to the raw `signal` column.
+
+    Supplementary sectors (``config.settings.SUPPLEMENTARY_SECTORS``, e.g.
+    UFO/Space) are excluded — they're tactical overlays the user sizes
+    separately and should not dilute the equal-weight allocation across
+    the 11 SPDR sectors.
     """
+    from config.settings import SUPPLEMENTARY_SECTORS
+
     if "state" in signals.columns:
         active = signals.index[signals["state"].isin(["NEW_BUY", "HOLD_IF_LONG"])]
     else:
         active = signals.index[signals["signal"] == "BUY"]
+    active = active.difference(SUPPLEMENTARY_SECTORS)
     if len(active) == 0:
         return pd.Series(dtype=float, name="target_weight")
     per_name = (1.0 - cash_buffer) / len(active)

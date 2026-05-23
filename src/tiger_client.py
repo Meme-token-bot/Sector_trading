@@ -90,9 +90,15 @@ def compute_drift_by_sector(snapshot: AccountSnapshot,
     A position in GDX is counted toward the XLB sector target. Cash and
     any holding that isn't in any expression list is ignored from the
     sector totals (but shown in a separate 'unmapped' row in the UI).
+
+    Supplementary sectors (e.g. UFO/Space) are excluded from the main
+    drift table — they're tactical overlays sized manually by the user,
+    not part of the equal-weight allocation. Their current value is
+    stashed in ``df.attrs["supplementary"]`` as a ``{sector: value}`` dict
+    so the UI can surface them in a separate row without a drift target.
     """
     from config.expressions import sector_for_ticker
-    from config.settings import SECTOR_ETFS
+    from config.settings import SECTOR_ETFS, SUPPLEMENTARY_SECTORS
 
     pos = snapshot.positions
     sector_value: dict[str, float] = {s: 0.0 for s in SECTOR_ETFS}
@@ -107,10 +113,19 @@ def compute_drift_by_sector(snapshot: AccountSnapshot,
             sector_value[sector] += mv
 
     nlv = snapshot.net_liquidation or 1.0
+
+    # Split supplementary sectors out of the drift universe before the
+    # main table is built. They get current value but no target / drift.
+    supplementary: dict[str, float] = {
+        s: sector_value.pop(s) for s in list(sector_value)
+        if s in SUPPLEMENTARY_SECTORS
+    }
+    main_sectors = [s for s in SECTOR_ETFS if s not in SUPPLEMENTARY_SECTORS]
+
     current_weight = pd.Series({s: v / nlv for s, v in sector_value.items()})
     current_val = pd.Series(sector_value)
 
-    tgt = targets.reindex(SECTOR_ETFS.keys()).fillna(0.0)
+    tgt = targets.reindex(main_sectors).fillna(0.0)
     target_val = tgt * snapshot.net_liquidation
 
     df = pd.DataFrame({
@@ -123,4 +138,5 @@ def compute_drift_by_sector(snapshot: AccountSnapshot,
     }).sort_values("trade_value", ascending=False)
 
     df.attrs["unmapped"] = unmapped
+    df.attrs["supplementary"] = supplementary
     return df

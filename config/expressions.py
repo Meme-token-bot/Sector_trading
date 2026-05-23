@@ -141,6 +141,24 @@ EXPRESSIONS: dict[str, list[Expression]] = {
                    "mREITs; rate-sensitive, distinct from equity REIT beta."),
         Expression("MORT", "VanEck Mortgage REIT Income",  "thematic", 1.3),
     ],
+    # Supplementary 12th sector — overlaps XLI/XLK/XLC. Excluded from the
+    # equal-weight target allocation via SUPPLEMENTARY_SECTORS in settings.py.
+    # Sized separately as a tactical overlay. Do not duplicate ITA/XAR here;
+    # they stay under XLI (sector_for_ticker returns first match).
+    "UFO": [
+        Expression("UFO",  "Procure Space (pure-play)",        "plain",    1.00,
+                   "OG space pure-play; Rocket Lab/MDA/Viasat top weights."),
+        Expression("ARKX", "ARK Space & Defense Innovation",   "thematic", 1.1,
+                   "Active; includes A&D — overlaps XLI's ITA/XAR."),
+        Expression("ROKT", "SPDR Kensho Final Frontiers",      "thematic", 1.0,
+                   "Space + deep-sea exploration; broader taxonomy."),
+        Expression("NASA", "Tema Space Innovators",            "thematic", 1.3,
+                   "Active; ~10% SpaceX via SPV. WARMING_UP until ~Feb 2027."),
+        Expression("ORBX", "Global X Space Tech",              "thematic", 1.2,
+                   "Tight space-exploration focus. Launched Apr 2026 — WARMING_UP."),
+        Expression("XOVR", "ERShares Private-Public Crossover","thematic", 1.2,
+                   "~10% SpaceX SPV; not pure space but a SpaceX vehicle."),
+    ],
 }
 
 

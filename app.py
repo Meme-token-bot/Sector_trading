@@ -8,7 +8,7 @@ import streamlit as st
 
 from config.settings import (
     BENCHMARK, GMAIL_ADDRESS, GMAIL_FILTER_ADDRESS, PARAMS,
-    SECTOR_ETFS, gmail_configured, tiger_configured,
+    SECTOR_ETFS, SUPPLEMENTARY_SECTORS, gmail_configured, tiger_configured,
 )
 from src.charts import STATE_COLORS as _STATE_COLORS, build_etf_chart, build_mini_chart, compute_chart_overlays
 from src.ui_tokens import EXPRESSION_STATE_COLORS, render_header, section
@@ -226,6 +226,23 @@ with tab_dashboard:
                     "you already had a position. CHASE rows are excluded from targets entirely."
                 )
 
+            # Surface any supplementary sector (e.g. UFO/Space) that's in a
+            # BUY-class state, separately — these are tactical overlays sized
+            # manually, not part of the equal-weight allocation above.
+            _suppl_active = [
+                s for s in SUPPLEMENTARY_SECTORS
+                if s in signals.index
+                and signals.loc[s, "state"] in {"NEW_BUY", "HOLD_IF_LONG"}
+            ]
+            if _suppl_active:
+                stdf = pd.DataFrame({
+                    "sector":        [SECTOR_ETFS[s] for s in _suppl_active],
+                    "state":         [signals.loc[s, "state"] for s in _suppl_active],
+                    "target_weight": ["tactical overlay — size manually"
+                                      for _ in _suppl_active],
+                }, index=_suppl_active)
+                st.dataframe(stdf, use_container_width=True)
+
         with st.expander("How to read the State column", expanded=False):
             st.markdown(
                 f"""
@@ -260,14 +277,20 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
             with st.expander("Enter NLV manually for a dry-run drift table"):
                 manual_nlv = st.number_input("Net liquidation value ($)",
                                              min_value=0.0, value=100_000.0, step=1000.0)
+                _main_sectors = [s for s in SECTOR_ETFS
+                                 if s not in SUPPLEMENTARY_SECTORS]
                 drift_manual = pd.DataFrame({
-                    "target_weight": targets.reindex(SECTOR_ETFS.keys()).fillna(0.0),
-                    "target_value": (targets.reindex(SECTOR_ETFS.keys()).fillna(0.0)
+                    "target_weight": targets.reindex(_main_sectors).fillna(0.0),
+                    "target_value": (targets.reindex(_main_sectors).fillna(0.0)
                                      * manual_nlv),
                 })
                 drift_manual["target_weight"] = drift_manual["target_weight"].map("{:.1%}".format)
                 drift_manual["target_value"] = drift_manual["target_value"].map("${:,.0f}".format)
                 st.dataframe(drift_manual, use_container_width=True)
+                st.caption(
+                    f"Supplementary sectors ({', '.join(sorted(SUPPLEMENTARY_SECTORS))}) "
+                    "are excluded from the equal-weight allocation — size them separately."
+                )
         else:
             try:
                 snap = _cached_tiger_snapshot()
@@ -291,6 +314,22 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
                     show[["target_weight", "current_weight", "drift", "trade_value"]],
                     use_container_width=True,
                 )
+
+                # Supplementary sectors (e.g. UFO/Space) — tactical overlay
+                # rows shown with current value only, no drift target.
+                supplementary = drift.attrs.get("supplementary", {})
+                supplementary = {s: v for s, v in supplementary.items() if v > 0}
+                if supplementary:
+                    st.caption("Tactical overlays — sized manually, no drift target")
+                    suppl_df = pd.DataFrame(
+                        [(SECTOR_ETFS.get(s, s),
+                          signals.loc[s, "state"] if s in signals.index else "—",
+                          v)
+                         for s, v in supplementary.items()],
+                        columns=["sector", "state", "current_value"],
+                    )
+                    suppl_df["current_value"] = suppl_df["current_value"].map("${:,.0f}".format)
+                    st.dataframe(suppl_df, use_container_width=True, hide_index=True)
 
                 unmapped = drift.attrs.get("unmapped", {})
                 if unmapped:

@@ -35,6 +35,14 @@ contains at least 2-3 newsletters touching each sector. Suggested sources:
 - **Goldman Top of Mind**
 - **JPM Cross-Asset Insights**
 
+### Space sector seeds (new — supplementary 12th sector)
+Space is a thematic overlay that cuts across XLI/XLK/XLC. These three
+have enough cadence and ticker-specificity to score reliably:
+
+- **Payload** (payloadspace.com) — daily, business-of-space, names tickers
+- **Space.biz** by Ian Vorbach (spacedotbiz.substack.com) — weekly, investor angle, interviews Quilty Analytics
+- **Cyclop SpaceTech** (Substack) — weekly, research-driven, data-backed
+
 ## Operational tip — Gmail filter address
 
 Create a dedicated Gmail filter address such as `<you>+macro@gmail.com`

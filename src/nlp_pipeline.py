@@ -20,12 +20,14 @@ infer from the text or use today.
    - "Defensive" if the author favors safety (utilities, staples, healthcare, cash, gold, bonds).
    - "Expansionary" if the author favors risk-on / cyclical / growth.
    - "Neutral" if mixed or no clear regime call.
-4. `sector_ratings`: ONLY include the 11 US SPDR Select Sector ETFs the author \
-explicitly discusses. Do not list a sector with score 0 just because it wasn't \
-mentioned — omit it entirely. Map general themes to the right ETF, e.g. \
+4. `sector_ratings`: ONLY include the 12 sectors the author explicitly \
+discusses (the 11 US SPDR Select Sector ETFs plus UFO for the Space sector). \
+Do not list a sector with score 0 just because it wasn't mentioned — omit it \
+entirely. Map general themes to the right ETF, e.g. \
 "semiconductors" → XLK, "banks" → XLF, "oil majors" → XLE, "REITs" → XLRE, \
 "media/telecom" → XLC, "homebuilders/autos/retail" → XLY, "gold miners" → XLB, \
-"copper miners" → XLB, "biotech" → XLV.
+"copper miners" → XLB, "biotech" → XLV, \
+"space/satellites/launch/Starlink/Rocket Lab/Blue Origin/space tourism/orbital/lunar" → UFO.
 5. `sentiment_score`: integer -5..+5. Use -5/+5 only for unambiguous strong calls.
 6. `reasoning`: quote or paraphrase the author's actual stated reason. Do not invent.
 7. `summary`: 2-3 sentences, neutral, capturing the macro thesis.

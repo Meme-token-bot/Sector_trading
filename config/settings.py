@@ -28,7 +28,14 @@ SECTOR_ETFS: dict[str, str] = {
     "XLP":  "Consumer Staples",
     "XLU":  "Utilities",
     "XLRE": "Real Estate",
+    "UFO":  "Space",
 }
+# Sectors that produce signals but do NOT participate in the equal-weight
+# target allocation that the 11 SPDR sectors share. Treated as tactical
+# overlays — the user sizes them separately. target_weights() filters
+# these out; compute_drift_by_sector() stashes them in df.attrs["supplementary"]
+# so the UI can render them without a drift comparison.
+SUPPLEMENTARY_SECTORS: frozenset[str] = frozenset({"UFO"})
 BENCHMARK = "SPY"
 MACRO_TICKERS = {
     "GOLD":   "GC=F",
