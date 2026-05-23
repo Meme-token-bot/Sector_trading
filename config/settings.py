@@ -77,6 +77,9 @@ PARAMS = SignalParams()
 # --- LLM ---------------------------------------------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Optional override for the Weekly Recap tab — set in .env if synthesis
+# quality on gpt-4o-mini is insufficient. Defaults to OPENAI_MODEL.
+WEEKLY_RECAP_MODEL = os.getenv("WEEKLY_RECAP_MODEL", "") or OPENAI_MODEL
 
 # --- Tiger -------------------------------------------------------------
 TIGER_ID = os.getenv("TIGER_ID", "")

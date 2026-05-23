@@ -24,6 +24,7 @@ from src.price_store import load_ohlcv, load_ohlcv_multi, update_all
 from src.signal_history import build_signal_history
 from src.signals import build_signals, refine_signals, target_weights
 from src.trend import build_sentiment_trend
+from src.weekly_recap import gather_context, generate_recap
 
 st.set_page_config(
     page_title="Sector Rotation",
@@ -148,10 +149,10 @@ render_header(
     ),
 )
 
-(tab_dashboard, tab_macro, tab_price, tab_expressions, tab_trend,
+(tab_dashboard, tab_recap, tab_macro, tab_price, tab_expressions, tab_trend,
  tab_inbox, tab_ingest, tab_history) = st.tabs(
-    ["📈 Dashboard", "🌐 Macro", "📉 Price Action", "🎯 Expressions", "✨ Trend",
-     "📧 Inbox", "📥 Ingest Newsletter", "🗂 History"]
+    ["📈 Dashboard", "📰 Weekly Recap", "🌐 Macro", "📉 Price Action",
+     "🎯 Expressions", "✨ Trend", "📧 Inbox", "📥 Ingest Newsletter", "🗂 History"]
 )
 
 with tab_dashboard:
@@ -352,6 +353,178 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
         if st.button("🔄 Force refresh all caches"):
             st.cache_data.clear()
             st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Weekly Recap tab
+# ---------------------------------------------------------------------------
+# Button-triggered synthesis of the past 7 days of newsletters + the current
+# macro tape into a plain-language brief. One OpenAI call per generation.
+# Result is cached for 12h keyed on date.today().isoformat() so re-clicks
+# within the same day don't burn credit; "Force regenerate" clears the cache.
+
+# Tilt → row-tint colors for the allocation table.  Map onto the existing
+# sector state palette so green/red mean the same thing across tabs.
+_TILT_TINT: dict[str, str] = {
+    "Overweight":   _STATE_COLORS["NEW_BUY"],
+    "Equal-weight": "",
+    "Underweight":  _STATE_COLORS["REDUCE"],
+    "Avoid":        _STATE_COLORS["SELL"],
+}
+_TILT_PREFIX: dict[str, str] = {
+    "Overweight":   "🟢",
+    "Equal-weight": "⚪",
+    "Underweight":  "🟤",
+    "Avoid":        "🔴",
+}
+
+
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def _cached_weekly_recap(as_of_iso: str) -> dict:
+    """Run gather_context + generate_recap; return a JSON-roundtrip dict so
+    streamlit's cache can pickle it cleanly across Pydantic versions.
+    """
+    ctx = gather_context(as_of=date.fromisoformat(as_of_iso), lookback_days=7)
+    if ctx.n_newsletters == 0:
+        # Empty marker — caller renders a warning rather than the recap.
+        return {"_empty": True, "as_of": as_of_iso}
+    recap = generate_recap(ctx)
+    return recap.model_dump(mode="json")
+
+
+with tab_recap:
+    section(
+        "📰 Weekly Recap",
+        help=(
+            "A plain-language synthesis of the past 7 days of ingested "
+            "newsletters and the current macro tape, sector by sector."
+        ),
+    )
+
+    st.caption(
+        "Reads the last 7 days of newsletters + live macro and calls "
+        f"gpt-4o-mini. ~one OpenAI call per generation."
+    )
+
+    _recap_btn_cols = st.columns([1, 1, 3])
+    _gen_clicked = _recap_btn_cols[0].button(
+        "Generate weekly recap", key="recap_generate_btn", type="primary",
+    )
+    _force_clicked = _recap_btn_cols[1].button(
+        "Force regenerate", key="recap_force_btn",
+        help="Clear today's cached recap and call OpenAI again.",
+    )
+
+    if _force_clicked:
+        _cached_weekly_recap.clear()
+        _gen_clicked = True  # treat as a generate request
+
+    if _gen_clicked:
+        _today_iso = date.today().isoformat()
+        with st.spinner("Synthesising weekly recap…"):
+            try:
+                _recap_payload = _cached_weekly_recap(_today_iso)
+            except Exception as e:
+                st.error(f"Recap generation failed: {e}")
+                _recap_payload = None
+
+        if _recap_payload is None:
+            pass
+        elif _recap_payload.get("_empty"):
+            st.warning(
+                "No newsletters ingested in the last 7 days. Use the "
+                "**📧 Inbox** or **📥 Ingest Newsletter** tab to add coverage, "
+                "then come back here."
+            )
+        else:
+            # Re-hydrate as the Pydantic model for typed access.
+            from src.schemas import WeeklyRecap as _WR
+            recap = _WR.model_validate(_recap_payload)
+
+            # ---- Header metrics ----
+            h1, h2, h3 = st.columns(3)
+            h1.metric("Newsletters analysed", recap.n_newsletters)
+            h2.metric("Week ending",
+                      recap.generated_for_week_ending.isoformat())
+            h3.metric("Regime", recap.macro.regime_label.value)
+
+            # ---- Macro narrative ----
+            section("🌐 Macro narrative", level=3)
+            st.markdown(recap.macro.summary)
+
+            mn_left, mn_right = st.columns(2)
+            with mn_left:
+                st.markdown("**Dominant themes**")
+                if recap.macro.dominant_themes:
+                    for t in recap.macro.dominant_themes:
+                        st.markdown(f"- {t}")
+                else:
+                    st.caption("None surfaced.")
+            with mn_right:
+                st.markdown("**Contradictions**")
+                if recap.macro.contradictions:
+                    for c in recap.macro.contradictions:
+                        st.markdown(f"- {c}")
+                else:
+                    st.caption("None — newsletters broadly aligned.")
+
+            # ---- Sector recaps ----
+            section("🎯 Sector recaps", level=3)
+            # Order: Overweight first, then Equal-weight, Underweight, Avoid.
+            _tilt_by_ticker = {a.ticker: a.suggested_tilt.value
+                               for a in recap.allocation}
+            _tilt_rank = {"Overweight": 0, "Equal-weight": 1,
+                          "Underweight": 2, "Avoid": 3}
+
+            def _sector_sort_key(s):
+                return _tilt_rank.get(
+                    _tilt_by_ticker.get(s.ticker, "Equal-weight"), 1
+                )
+
+            for s in sorted(recap.sectors, key=_sector_sort_key):
+                tilt = _tilt_by_ticker.get(s.ticker, "Equal-weight")
+                prefix = _TILT_PREFIX.get(tilt, "⚪")
+                consensus = s.newsletter_consensus.value
+                title = (f"{prefix} {s.ticker} — {s.sector_name} — "
+                         f"consensus: {consensus}")
+                with st.expander(title, expanded=(tilt == "Overweight")):
+                    st.markdown(s.plain_language_summary)
+                    st.markdown(f"_Macro alignment — {s.macro_alignment}_")
+                    if s.key_risks:
+                        st.markdown("**Key risks**")
+                        for r in s.key_risks:
+                            st.markdown(f"- {r}")
+
+            # ---- Allocation table ----
+            section("📊 Allocation tilts", level=3)
+            alloc_df = pd.DataFrame([
+                {
+                    "Ticker": a.ticker,
+                    "Tilt": a.suggested_tilt.value,
+                    "Rationale": a.rationale,
+                }
+                for a in recap.allocation
+            ])
+
+            def _alloc_row_style(row: pd.Series) -> list[str]:
+                color = _TILT_TINT.get(row.get("Tilt", ""), "")
+                return [f"background-color: {color}; color: #eee"
+                        if color else "" for _ in row]
+
+            if not alloc_df.empty:
+                styled_alloc = alloc_df.style.apply(_alloc_row_style, axis=1)
+                st.dataframe(
+                    styled_alloc, use_container_width=True, hide_index=True,
+                    column_config={
+                        "Ticker":    st.column_config.TextColumn("Ticker", width="small"),
+                        "Tilt":      st.column_config.TextColumn("Tilt", width="small"),
+                        "Rationale": st.column_config.TextColumn("Rationale", width="large"),
+                    },
+                )
+            else:
+                st.caption("No allocation tilts returned.")
+
+            st.caption(recap.caveats)
 
 
 # ---------------------------------------------------------------------------
