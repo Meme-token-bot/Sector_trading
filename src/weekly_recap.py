@@ -416,6 +416,15 @@ def _get_openai_client():
     return OpenAI(api_key=OPENAI_API_KEY)
 
 
+def resolve_recap_model() -> str:
+    """Return the model name `generate_recap` will use. Exposed so the cache
+    layer can key persistence by the same name without duplicating the lookup.
+    """
+    from config import settings as _settings
+    return (getattr(_settings, "WEEKLY_RECAP_MODEL", None)
+            or _settings.OPENAI_MODEL)
+
+
 def generate_recap(context: WeeklyRecapContext) -> WeeklyRecap:
     """Call OpenAI to synthesise the weekly recap.
 
@@ -424,9 +433,7 @@ def generate_recap(context: WeeklyRecapContext) -> WeeklyRecap:
     into a stronger model just for synthesis without touching the rest of
     the pipeline.
     """
-    from config import settings as _settings
-    model = (getattr(_settings, "WEEKLY_RECAP_MODEL", None)
-             or _settings.OPENAI_MODEL)
+    model = resolve_recap_model()
 
     client = _get_openai_client()
     user_content = _format_context_as_markdown(context)

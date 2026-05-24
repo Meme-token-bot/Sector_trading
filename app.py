@@ -24,7 +24,7 @@ from src.price_store import load_ohlcv, load_ohlcv_multi, update_all
 from src.signal_history import build_signal_history
 from src.signals import build_signals, refine_signals, target_weights
 from src.trend import build_sentiment_trend
-from src.weekly_recap import gather_context, generate_recap
+from src.weekly_recap import gather_context, generate_recap, resolve_recap_model
 
 st.set_page_config(
     page_title="Sector Rotation",
@@ -779,15 +779,29 @@ _TILT_PREFIX: dict[str, str] = {
 
 @st.cache_data(ttl=12 * 3600, show_spinner=False)
 def _cached_weekly_recap(as_of_iso: str) -> dict:
-    """Run gather_context + generate_recap; return a JSON-roundtrip dict so
-    streamlit's cache can pickle it cleanly across Pydantic versions.
+    """Resolve a weekly recap for `as_of_iso` from SQLite if previously
+    generated, otherwise call OpenAI and persist the result. Returned dict
+    is the JSON-mode model_dump() of WeeklyRecap so Streamlit's in-memory
+    cache pickles cleanly across Pydantic versions.
     """
+    from src.db import load_weekly_recap, save_weekly_recap
+
+    model = resolve_recap_model()
+
+    stored = load_weekly_recap(as_of_iso, model)
+    if stored is not None:
+        return stored
+
     ctx = gather_context(as_of=date.fromisoformat(as_of_iso), lookback_days=7)
     if ctx.n_newsletters == 0:
         # Empty marker — caller renders a warning rather than the recap.
+        # Not persisted: re-checked on every call so newly ingested
+        # newsletters land in the next recap without a manual cache clear.
         return {"_empty": True, "as_of": as_of_iso}
     recap = generate_recap(ctx)
-    return recap.model_dump(mode="json")
+    payload = recap.model_dump(mode="json")
+    save_weekly_recap(as_of_iso, model, payload, ctx.n_newsletters)
+    return payload
 
 
 with tab_recap:
@@ -801,27 +815,61 @@ with tab_recap:
 
     st.caption(
         "Reads the last 7 days of newsletters + live macro and calls "
-        f"gpt-4o-mini. ~one OpenAI call per generation."
+        f"{resolve_recap_model()}. Each generation is saved to SQLite — "
+        "reopening the tab or picking a past date below loads from disk "
+        "with zero OpenAI cost."
     )
+
+    # ---- Past-recaps picker (no token spend) ----
+    from src.db import list_weekly_recaps, delete_weekly_recap
+    _history = list_weekly_recaps(limit=50)
+    _today_iso = date.today().isoformat()
+
+    _picker_cols = st.columns([2, 3])
+    with _picker_cols[0]:
+        if _history.empty:
+            _picker_options = [_today_iso]
+            _picker_default = 0
+        else:
+            _picker_options = list(dict.fromkeys(
+                [_today_iso, *_history["as_of_iso"].tolist()]
+            ))
+            _picker_default = 0
+        _selected_iso = st.selectbox(
+            "Recap date", _picker_options, index=_picker_default,
+            key="recap_date_select",
+            help=("Today's date generates fresh; past dates load the stored "
+                  "recap without re-calling OpenAI."),
+        )
+    with _picker_cols[1]:
+        if not _history.empty:
+            st.caption(
+                f"📚 {len(_history)} stored recap"
+                f"{'s' if len(_history) != 1 else ''} on disk — most recent "
+                f"first."
+            )
 
     _recap_btn_cols = st.columns([1, 1, 3])
     _gen_clicked = _recap_btn_cols[0].button(
-        "Generate weekly recap", key="recap_generate_btn", type="primary",
+        "Generate / load recap", key="recap_generate_btn", type="primary",
     )
     _force_clicked = _recap_btn_cols[1].button(
         "Force regenerate", key="recap_force_btn",
-        help="Clear today's cached recap and call OpenAI again.",
+        help=("Discard the stored recap for the selected date and call "
+              "OpenAI again. Costs one API call."),
     )
 
     if _force_clicked:
+        # Purge both in-memory cache AND the persisted row for this date,
+        # then fall through to a generate.
         _cached_weekly_recap.clear()
-        _gen_clicked = True  # treat as a generate request
+        delete_weekly_recap(_selected_iso, resolve_recap_model())
+        _gen_clicked = True
 
     if _gen_clicked:
-        _today_iso = date.today().isoformat()
-        with st.spinner("Synthesising weekly recap…"):
+        with st.spinner("Loading or synthesising weekly recap…"):
             try:
-                _recap_payload = _cached_weekly_recap(_today_iso)
+                _recap_payload = _cached_weekly_recap(_selected_iso)
             except Exception as e:
                 st.error(f"Recap generation failed: {e}")
                 _recap_payload = None

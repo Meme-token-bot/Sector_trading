@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, timedelta
@@ -37,6 +38,17 @@ CREATE TABLE IF NOT EXISTS sector_ratings (
 
 CREATE INDEX IF NOT EXISTS idx_sr_ticker ON sector_ratings(ticker);
 CREATE INDEX IF NOT EXISTS idx_nl_date   ON newsletters(publication_date);
+
+CREATE TABLE IF NOT EXISTS weekly_recaps (
+    as_of_iso       TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    generated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    n_newsletters   INTEGER NOT NULL,
+    payload_json    TEXT NOT NULL,
+    PRIMARY KEY (as_of_iso, model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_wr_as_of ON weekly_recaps(as_of_iso DESC);
 """
 
 
@@ -183,3 +195,60 @@ def recent_newsletters(limit: int = 25) -> pd.DataFrame:
 def delete_newsletter(newsletter_id: int) -> None:
     with _conn() as c:
         c.execute("DELETE FROM newsletters WHERE id = ?", (newsletter_id,))
+
+
+# ---------------------------------------------------------------------------
+# Weekly recap persistence — one row per (as_of_iso, model). Lets the user
+# regenerate the dashboard tab without re-spending OpenAI tokens and keeps a
+# browsable history of past recaps.
+# ---------------------------------------------------------------------------
+
+def save_weekly_recap(as_of_iso: str, model: str,
+                      payload: dict, n_newsletters: int) -> None:
+    """Upsert one recap. `payload` is the JSON-mode model_dump() of WeeklyRecap."""
+    init_db()
+    with _conn() as c:
+        c.execute(
+            """INSERT INTO weekly_recaps
+                   (as_of_iso, model, n_newsletters, payload_json,
+                    generated_at)
+               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(as_of_iso, model) DO UPDATE SET
+                   n_newsletters = excluded.n_newsletters,
+                   payload_json  = excluded.payload_json,
+                   generated_at  = CURRENT_TIMESTAMP""",
+            (as_of_iso, model, n_newsletters, json.dumps(payload)),
+        )
+
+
+def load_weekly_recap(as_of_iso: str, model: str) -> dict | None:
+    """Return the stored payload dict, or None if no row exists."""
+    init_db()
+    with _conn() as c:
+        row = c.execute(
+            """SELECT payload_json FROM weekly_recaps
+               WHERE as_of_iso = ? AND model = ?""",
+            (as_of_iso, model),
+        ).fetchone()
+    return json.loads(row["payload_json"]) if row else None
+
+
+def list_weekly_recaps(limit: int = 25) -> pd.DataFrame:
+    """Browsable history: most recent first, all models."""
+    init_db()
+    with _conn() as c:
+        return pd.read_sql_query(
+            """SELECT as_of_iso, model, generated_at, n_newsletters
+               FROM weekly_recaps
+               ORDER BY as_of_iso DESC, generated_at DESC
+               LIMIT ?""",
+            c, params=(limit,),
+        )
+
+
+def delete_weekly_recap(as_of_iso: str, model: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "DELETE FROM weekly_recaps WHERE as_of_iso = ? AND model = ?",
+            (as_of_iso, model),
+        )
