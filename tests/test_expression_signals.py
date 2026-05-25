@@ -12,8 +12,11 @@ from config.expressions import Expression
 from config.settings import PARAMS
 from src.expression_signals import (
     ExpressionSignal,
+    blend_theme_sentiment,
+    build_theme_sentiment_loader,
     compute_expression_signal,
     compute_expressions_for_sector,
+    rank_expressions,
 )
 
 
@@ -181,3 +184,103 @@ def test_compute_expressions_for_sector_no_parent_data(monkeypatch):
     assert results, "should still return one signal per expression"
     assert all(r.state == "NO_DATA" for r in results)
     assert all("parent ETF has no price data" in r.reason for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Theme-news overlay
+# ---------------------------------------------------------------------------
+
+def test_theme_key_resolved_from_ticker():
+    # SOXX is a SEMIS expression; FOO maps to no theme.
+    sig = compute_expression_signal(
+        _make_expr(ticker="SOXX"), "NEW_BUY", _linear(95, 105, 300),
+        _linear(98, 102, 300))
+    assert sig.theme_key == "SEMIS"
+    sig2 = compute_expression_signal(
+        _make_expr(ticker="FOO"), "NEW_BUY", _linear(95, 105, 300),
+        _linear(98, 102, 300))
+    assert sig2.theme_key is None
+
+
+def test_news_flag_contradicts_on_confirmed_bad_news():
+    sig = compute_expression_signal(
+        _make_expr(ticker="SOXX"), "NEW_BUY", _linear(95, 105, 300),
+        _linear(98, 102, 300), theme_sentiment=-3.0, theme_n_obs=4)
+    assert sig.state == "CONFIRMED"
+    assert sig.news_flag == "NEWS_CONTRADICTS"
+
+
+def test_news_flag_divergence_on_broken_good_news():
+    body = list(np.linspace(80, 130, 250))
+    tail = list(np.linspace(130, 60, 50))
+    sig = compute_expression_signal(
+        _make_expr(ticker="GDX"), "NEW_BUY", _series(body + tail),
+        _linear(100, 110, 300), theme_sentiment=3.0, theme_n_obs=3)
+    assert sig.state == "BROKEN"
+    assert sig.news_flag == "NEWS_DIVERGENCE"
+
+
+def test_no_flag_without_theme_sentiment():
+    sig = compute_expression_signal(
+        _make_expr(ticker="SOXX"), "NEW_BUY", _linear(95, 105, 300),
+        _linear(98, 102, 300))
+    assert sig.news_flag is None
+    assert sig.theme_sentiment is None
+
+
+def test_blend_theme_sentiment():
+    # both: (1-0.4)*4 + 0.4*(-1) = 2.0
+    assert blend_theme_sentiment(4.0, 2, -1.0, 5, 0.4) == (2.0, 7)
+    # one-sided
+    assert blend_theme_sentiment(3.0, 2, None, 0) == (3.0, 2)
+    assert blend_theme_sentiment(None, 0, -2.0, 4) == (-2.0, 4)
+    # neither
+    assert blend_theme_sentiment(None, 0, None, 0) == (None, 0)
+
+
+def _sig(ticker, state, theme_sentiment=None):
+    return ExpressionSignal(
+        ticker=ticker, state=state, reason="", above_own_sma=None,
+        own_extension_pct=None, own_return_3m=None, parent_return_3m=None,
+        rs_vs_parent=None, beta_scaled_cutoff=None,
+        theme_sentiment=theme_sentiment)
+
+
+def test_rank_expressions_state_then_news():
+    sigs = [
+        _sig("A", "LAGGING", 1.0),
+        _sig("B", "CONFIRMED", -2.0),
+        _sig("C", "CONFIRMED", 4.0),
+        _sig("D", "BROKEN", 5.0),
+    ]
+    ranked = [s.ticker for s in rank_expressions(sigs)]
+    # CONFIRMED before LAGGING before BROKEN; within CONFIRMED, higher news first.
+    assert ranked == ["C", "B", "A", "D"]
+
+
+def test_build_theme_sentiment_loader_blends_and_skips_plain():
+    nl = pd.DataFrame({"score": [3.0], "n_obs": [2]},
+                      index=pd.Index(["URANIUM"], name="theme_key"))
+    news = pd.DataFrame({"score": [4.0], "n_headlines": [5]},
+                        index=pd.Index(["URANIUM"], name="theme_key"))
+    loader = build_theme_sentiment_loader(nl, news, weight=0.4)
+    score, n = loader("URA")        # URA is a URANIUM expression
+    assert score == pytest.approx(0.6 * 3.0 + 0.4 * 4.0)
+    assert n == 7
+    assert loader("XLB") == (None, 0)   # plain sector proxy → no theme
+
+
+def test_compute_expressions_for_sector_passes_theme_overlay():
+    def ohlcv(ticker: str) -> pd.Series:
+        return _linear(95, 105, 300)
+
+    def theme_loader(ticker: str):
+        return (-4.0, 3) if ticker in ("SOXX", "SMH") else (None, 0)
+
+    results = compute_expressions_for_sector(
+        "XLK", "NEW_BUY", ohlcv, theme_sentiment_loader=theme_loader)
+    by = {r.ticker: r for r in results}
+    assert by["SOXX"].theme_sentiment == -4.0
+    assert by["SOXX"].news_flag == "NEWS_CONTRADICTS"  # CONFIRMED + bad news
+    # plain proxy carries no theme overlay
+    assert by["XLK"].theme_sentiment is None

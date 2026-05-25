@@ -123,3 +123,18 @@ class ExtractionParams:
     fetch_timeout_seconds: int = 15
 
 EXTRACTION = ExtractionParams()
+
+# --- Expression theme news ---------------------------------------------
+@dataclass(frozen=True)
+class ExpressionParams:
+    # Blend weight for the automated news leg when combining with newsletter
+    # theme sentiment: combined = (1 - w)*newsletter + w*news. Newsletters are
+    # deeper/slower, news is broader/fresher; default leans on newsletters.
+    theme_news_weight: float = 0.4
+    # |combined theme sentiment| at/above which the picker raises a news flag
+    # (price-vs-news contradiction / divergence).
+    theme_news_flag_threshold: float = 2.0
+    # How stale a stored theme_news score may be before it's ignored.
+    theme_news_max_age_days: int = 14
+
+EXPRESSION = ExpressionParams()

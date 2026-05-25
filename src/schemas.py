@@ -20,6 +20,21 @@ SectorTicker = Literal[
     "XLE", "XLV", "XLP", "XLU", "XLRE", "UFO",
 ]
 
+# Expression-theme keys. MUST stay in sync with config.themes.THEME_KEYS
+# (tests/test_themes.py enforces this). Kept as a Literal — like SectorTicker —
+# so OpenAI structured outputs can only emit a valid theme.
+ThemeKey = Literal[
+    "SEMIS", "SOFTWARE_CLOUD", "AI_ROBOTICS", "CYBER", "QUANTUM", "CLEAN_ENERGY",
+    "HOMEBUILDERS", "RETAIL", "AUTOS_EV", "AIRLINES_TRAVEL",
+    "REGIONAL_BANKS", "CAPITAL_MARKETS", "INSURANCE", "FINTECH",
+    "DEFENSE_AERO", "INFRASTRUCTURE", "TRANSPORTS",
+    "METALS_MINING", "GOLD_SILVER_MINERS", "COPPER", "LITHIUM_BATTERY",
+    "URANIUM", "RARE_EARTH", "AGRIBUSINESS",
+    "OIL_GAS_EP", "MIDSTREAM",
+    "BIOTECH", "PHARMA_DEVICES", "HEALTH_PROVIDERS",
+    "SMART_GRID", "DATACENTER_REIT", "MORTGAGE_REIT", "SPACE",
+]
+
 
 class MacroBias(str, Enum):
     DEFENSIVE = "Defensive"
@@ -42,6 +57,21 @@ class SectorRating(BaseModel):
     )
 
 
+class ThemeRating(BaseModel):
+    theme_key: ThemeKey
+    sentiment_score: int = Field(
+        ..., ge=-5, le=5,
+        description="Author's view on this sub-sector theme (e.g. semiconductors, "
+                    "uranium, biotech). -5 strongly bearish, 0 neutral, +5 strongly "
+                    "bullish.",
+    )
+    reasoning: str = Field(
+        ..., max_length=400,
+        description="One or two sentences with the author's actual stated reason "
+                    "for the theme. Do NOT invent — omit themes not addressed.",
+    )
+
+
 class NewsletterAnalysis(BaseModel):
     """One newsletter -> one of these. Persisted to SQLite."""
     author: str = Field(..., description="Author or publication name.")
@@ -51,6 +81,13 @@ class NewsletterAnalysis(BaseModel):
         default_factory=list,
         description="Only include sectors the author explicitly discusses. "
                     "Omit sectors that are not addressed — do not fill with zeros.",
+    )
+    theme_ratings: list[ThemeRating] = Field(
+        default_factory=list,
+        description="Sub-sector THEMES the author explicitly discusses (e.g. "
+                    "semiconductors, uranium, biotech, regional banks). Independent "
+                    "of sector_ratings — a newsletter may tag a theme without its "
+                    "parent sector and vice-versa. Omit themes not addressed.",
     )
     summary: str = Field(
         ..., max_length=600,
@@ -274,3 +311,27 @@ class WeeklyRecap(BaseModel):
         ..., max_length=400,
         description="1-2 sentences: informational only, not personalised advice.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Theme news scoring (response_format for src.ticker_news batched scoring)
+# ---------------------------------------------------------------------------
+
+class ThemeNewsScore(BaseModel):
+    theme_key: ThemeKey
+    score: int = Field(
+        ..., ge=-5, le=5,
+        description="Net tone of the supplied recent headlines for this theme. "
+                    "-5 strongly negative, 0 neutral/mixed, +5 strongly positive.",
+    )
+    n_headlines: int = Field(
+        ..., ge=0, description="How many headlines informed the score.")
+    top_headline: str = Field(
+        "", max_length=300,
+        description="The single most market-relevant headline verbatim (or '' if none).",
+    )
+
+
+class ThemeNewsBatch(BaseModel):
+    """response_format wrapper — one score per theme present in the input."""
+    scores: list[ThemeNewsScore] = Field(default_factory=list)

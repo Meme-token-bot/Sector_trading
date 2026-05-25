@@ -48,6 +48,23 @@ AUTHOR_DOMAINS: list[str] = [
     "stratechery.com",         # Ben Thompson — tech / comms (XLK, XLC)
     "bespokepremium.com",      # Bespoke Investment — sector breadth
     "thefelderreport.com",     # Jesse Felder — contrarian / value
+    # --- Expression-theme newsletters (theme-level coverage) ---
+    "semianalysis.com",        # SemiAnalysis — semiconductors (SOXX/SMH)
+    "thequantuminsider.com",   # The Quantum Insider — quantum (QTUM/WQTM)
+    "breakingdefense.com",     # Breaking Defense — defense/aero (ITA/XAR)
+    "aviationweek.com",        # Aviation Week — defense/aero, airlines
+    "freightwaves.com",        # FreightWaves — transports (IYT/XTN)
+    "uraniuminsider.com",      # Justin Huhn — uranium (URA/URNM)
+    "benchmarkminerals.com",   # Benchmark Mineral Intelligence — lithium/rare-earth
+    "goehringrozencwajg.com",  # G&R — natural resources / miners (GDX/XME/COPX)
+    "hfir.com",                # HFI Research — oil & gas (XOP/OIH/FCG)
+    "endpoints.news",          # Endpoints News — biotech (XBI/IBB)
+    "endpts.com",              # Endpoints News (legacy domain, still redirects)
+    "statnews.com",            # STAT — biotech/pharma (XBI/XPH)
+    "timmermanreport.com",     # Luke Timmerman — biotech (XBI)
+    "datacenterfrontier.com",  # Data Center Frontier — data-center REITs (DTCR)
+    "heatmap.news",            # Heatmap — energy transition / grid (GRID/ICLN)
+    "netinterest.co",          # Marc Rubinstein — banks/fintech (KRE/FINX)
 ]
 
 # Government / public data sources

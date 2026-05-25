@@ -39,6 +39,27 @@ CREATE TABLE IF NOT EXISTS sector_ratings (
 CREATE INDEX IF NOT EXISTS idx_sr_ticker ON sector_ratings(ticker);
 CREATE INDEX IF NOT EXISTS idx_nl_date   ON newsletters(publication_date);
 
+CREATE TABLE IF NOT EXISTS theme_ratings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    newsletter_id   INTEGER NOT NULL,
+    theme_key       TEXT NOT NULL,
+    sentiment_score INTEGER NOT NULL,
+    reasoning       TEXT,
+    FOREIGN KEY (newsletter_id) REFERENCES newsletters(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_tr_theme ON theme_ratings(theme_key);
+
+CREATE TABLE IF NOT EXISTS theme_news (
+    theme_key    TEXT NOT NULL,
+    as_of        DATE NOT NULL,
+    score        REAL NOT NULL,
+    n_headlines  INTEGER NOT NULL,
+    top_headline TEXT,
+    fetched_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (theme_key, as_of)
+);
+
 CREATE TABLE IF NOT EXISTS weekly_recaps (
     as_of_iso       TEXT NOT NULL,
     model           TEXT NOT NULL,
@@ -129,6 +150,13 @@ def save_analysis(analysis: NewsletterAnalysis, raw_text: str) -> int | None:
             [(nid, r.ticker, r.sentiment_score, r.reasoning)
              for r in analysis.sector_ratings],
         )
+        c.executemany(
+            """INSERT INTO theme_ratings
+               (newsletter_id, theme_key, sentiment_score, reasoning)
+               VALUES (?, ?, ?, ?)""",
+            [(nid, r.theme_key, r.sentiment_score, r.reasoning)
+             for r in getattr(analysis, "theme_ratings", [])],
+        )
         return nid
 
 
@@ -177,6 +205,92 @@ def aggregate_sentiment(as_of: date | None = None,
     out.index.name = "ticker"
     # Enforce canonical column order.
     return out[empty_cols]
+
+
+def aggregate_theme_sentiment(as_of: date | None = None,
+                              lookback_days: int | None = None) -> pd.DataFrame:
+    """Per-theme rolling newsletter sentiment, mirroring aggregate_sentiment.
+
+    Returns DataFrame indexed by theme_key with columns: score (mean), n_obs.
+    Empty frame (those columns) when no theme ratings fall in the window.
+    """
+    as_of = as_of or date.today()
+    lookback = lookback_days or PARAMS.sentiment_lookback_days
+    cutoff = as_of - timedelta(days=lookback)
+
+    init_db()
+    with _conn() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT tr.theme_key, tr.sentiment_score
+            FROM theme_ratings tr
+            JOIN newsletters n ON n.id = tr.newsletter_id
+            WHERE n.publication_date >= ? AND n.publication_date <= ?
+            """,
+            c, params=(cutoff.isoformat(), as_of.isoformat()),
+        )
+    if df.empty:
+        return pd.DataFrame(columns=["score", "n_obs"]).rename_axis("theme_key")
+
+    grouped = df.groupby("theme_key")["sentiment_score"]
+    out = pd.DataFrame({
+        "score": grouped.mean().astype(float),
+        "n_obs": grouped.size().astype(int),
+    })
+    out.index.name = "theme_key"
+    return out
+
+
+def save_theme_news(as_of: date, rows: list[dict]) -> None:
+    """Upsert per-theme news scores for `as_of`.
+
+    Each row: {theme_key, score, n_headlines, top_headline}. Idempotent — a
+    re-run for the same day overwrites that day's scores.
+    """
+    if not rows:
+        return
+    init_db()
+    with _conn() as c:
+        c.executemany(
+            """INSERT INTO theme_news
+                   (theme_key, as_of, score, n_headlines, top_headline)
+               VALUES (:theme_key, :as_of, :score, :n_headlines, :top_headline)
+               ON CONFLICT(theme_key, as_of) DO UPDATE SET
+                   score=excluded.score,
+                   n_headlines=excluded.n_headlines,
+                   top_headline=excluded.top_headline,
+                   fetched_at=CURRENT_TIMESTAMP""",
+            [{"theme_key": r["theme_key"], "as_of": as_of.isoformat(),
+              "score": float(r["score"]), "n_headlines": int(r["n_headlines"]),
+              "top_headline": r.get("top_headline", "")} for r in rows],
+        )
+
+
+def latest_theme_news(max_age_days: int = 14) -> pd.DataFrame:
+    """Most-recent news score per theme within `max_age_days`.
+
+    Returns DataFrame indexed by theme_key with columns: score, n_headlines,
+    top_headline, as_of. Empty when nothing fresh enough.
+    """
+    cutoff = (date.today() - timedelta(days=max_age_days)).isoformat()
+    init_db()
+    with _conn() as c:
+        df = pd.read_sql_query(
+            """
+            SELECT tn.theme_key, tn.score, tn.n_headlines, tn.top_headline,
+                   tn.as_of
+            FROM theme_news tn
+            JOIN (SELECT theme_key, MAX(as_of) AS mx
+                  FROM theme_news WHERE as_of >= ? GROUP BY theme_key) latest
+              ON latest.theme_key = tn.theme_key AND latest.mx = tn.as_of
+            """,
+            c, params=(cutoff,),
+        )
+    if df.empty:
+        return pd.DataFrame(
+            columns=["score", "n_headlines", "top_headline", "as_of"]
+        ).rename_axis("theme_key")
+    return df.set_index("theme_key")
 
 
 def recent_newsletters(limit: int = 25) -> pd.DataFrame:

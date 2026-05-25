@@ -163,11 +163,44 @@ def _cached_macro_alignment_frame() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=10 * 60, show_spinner=False)
+def _cached_theme_sentiment_frames(as_of_iso: str) -> dict:
+    """Both theme-sentiment frames (newsletter + automated news) as records.
+
+    Cached so the per-sector expression calls don't re-hit the DB each render.
+    Returned as plain dicts (records) to keep streamlit's cache happy.
+    """
+    from src.db import aggregate_theme_sentiment, latest_theme_news
+    from config.settings import EXPRESSION
+    as_of = date.fromisoformat(as_of_iso)
+    nl = aggregate_theme_sentiment(as_of=as_of)
+    news = latest_theme_news(max_age_days=EXPRESSION.theme_news_max_age_days)
+    return {
+        "newsletter": nl.reset_index().to_dict("records"),
+        "news": news.reset_index().to_dict("records"),
+    }
+
+
+def _theme_loader(as_of_iso: str):
+    """Build a `ticker -> (blended_theme_sentiment, n_obs)` loader from the
+    cached theme frames. The DB reads are cached; this just reindexes."""
+    from src.expression_signals import build_theme_sentiment_loader
+    frames = _cached_theme_sentiment_frames(as_of_iso)
+    nl_df = pd.DataFrame(frames["newsletter"])
+    news_df = pd.DataFrame(frames["news"])
+    if not nl_df.empty:
+        nl_df = nl_df.set_index("theme_key")
+    if not news_df.empty:
+        news_df = news_df.set_index("theme_key")
+    return build_theme_sentiment_loader(nl_df, news_df)
+
+
+@st.cache_data(ttl=10 * 60, show_spinner=False)
 def _cached_top_vehicle(sector: str, parent_state: str,
                         as_of_iso: str) -> str:
-    """Top CONFIRMED expression ticker for a sector, falling back to the
-    sector ETF itself.  Used by the orders panel to pick the actual buy
-    vehicle for a NEW_BUY sector (or the sell vehicle when reducing).
+    """Top expression ticker for a sector, falling back to the sector ETF.
+    Used by the orders panel to pick the actual buy vehicle for a NEW_BUY
+    sector (or the sell vehicle when reducing).  News-aware: among CONFIRMED
+    vehicles, the one with the best theme news is surfaced first.
     """
     warmup_start = date.fromisoformat(as_of_iso) - timedelta(days=300)
 
@@ -178,7 +211,10 @@ def _cached_top_vehicle(sector: str, parent_state: str,
         return df["close"]
 
     try:
-        sigs = compute_expressions_for_sector(sector, parent_state, _loader)
+        from src.expression_signals import rank_expressions
+        sigs = rank_expressions(compute_expressions_for_sector(
+            sector, parent_state, _loader,
+            theme_sentiment_loader=_theme_loader(as_of_iso)))
     except Exception:
         return sector
     for s in sigs:
@@ -1474,7 +1510,10 @@ def _cached_expression_signals(
             return pd.Series(dtype=float)
         return df["close"]
 
-    sigs = compute_expressions_for_sector(sector, parent_state, _loader)
+    from src.expression_signals import rank_expressions
+    sigs = rank_expressions(compute_expressions_for_sector(
+        sector, parent_state, _loader,
+        theme_sentiment_loader=_theme_loader(as_of_iso)))
     return [
         {
             "ticker": s.ticker,
@@ -1484,6 +1523,11 @@ def _cached_expression_signals(
             # computable (NO_DATA / WARMING_UP); the renderer falls back to "—".
             "own_extension_pct": s.own_extension_pct,
             "beta_scaled_cutoff": s.beta_scaled_cutoff,
+            # Theme-news overlay.
+            "theme_key": s.theme_key,
+            "theme_sentiment": s.theme_sentiment,
+            "theme_n_obs": s.theme_n_obs,
+            "news_flag": s.news_flag,
         }
         for s in sigs
     ]
@@ -1665,12 +1709,26 @@ with tab_expressions:
     )
 
     # ---- Top control row ----
-    upd_col, asof_col, toggle_col = st.columns([1, 2, 2])
+    upd_col, news_col, asof_col, toggle_col = st.columns([1, 1, 2, 2])
     with upd_col:
         _render_update_price_data_button(
             key="exp_update_btn",
             extra_clears=[_cached_sector_sparklines, _cached_expression_signals],
         )
+    with news_col:
+        if st.button("🔄 Refresh theme news", key="exp_news_btn",
+                     help="Pull recent headlines per theme and re-score them "
+                          "(one batched LLM call). Updates the Theme news column."):
+            try:
+                from src.ticker_news import refresh_theme_news
+                with st.spinner("Fetching + scoring theme news…"):
+                    rows = refresh_theme_news()
+                _cached_theme_sentiment_frames.clear()
+                _cached_expression_signals.clear()
+                _cached_top_vehicle.clear()
+                st.success(f"Scored {len(rows)} themes from recent headlines.")
+            except Exception as e:
+                st.error(f"Theme-news refresh failed: {e}")
     with asof_col:
         st.caption(f"as of {date.today().isoformat()}")
     with toggle_col:
@@ -1768,16 +1826,41 @@ Shown as `"—"` for tickers with fewer than {PARAMS.sma_window} stored bars
                            f"({', '.join(missing)}) — click 🔄 Update price data above.")
 
             exp_sigs = _cached_expression_signals(sector, parent_state, today_iso)
-            sig_by_ticker = {d["ticker"]: d for d in exp_sigs}
+            # exp_sigs is already news-ranked (best vehicle to buy first); render
+            # in that order rather than config order so news moves the picker.
+            expr_by_ticker = {e.ticker: e for e in EXPRESSIONS[sector]}
 
             # Only include the Note column when at least one expression in
             # this sector has a non-empty note — avoids a blank column for
             # sectors that haven't been annotated yet.
             has_notes = any(e.note for e in EXPRESSIONS[sector])
+            # Only show the Theme news column when some expression in this
+            # sector actually has a theme-news observation.
+            has_theme_news = any(
+                (s.get("theme_sentiment") is not None and s.get("theme_n_obs"))
+                for s in exp_sigs
+            )
+
+            _FLAG_BADGE = {
+                "NEWS_CONTRADICTS": "⚠️ news contradicts price",
+                "NEWS_DIVERGENCE": "👀 news diverges (watch)",
+            }
+
+            def _theme_news_cell(s: dict) -> str:
+                ts = s.get("theme_sentiment")
+                n = int(s.get("theme_n_obs") or 0)
+                if ts is None or n == 0:
+                    return "—"
+                arrow = "🔺" if ts > 0 else ("🔻" if ts < 0 else "·")
+                cell = f"{arrow} {ts:+.1f} (n{n})"
+                flag = _FLAG_BADGE.get(s.get("news_flag") or "")
+                return f"{cell} · {flag}" if flag else cell
 
             rows = []
-            for e in EXPRESSIONS[sector]:
-                s = sig_by_ticker.get(e.ticker, {"state": "NO_DATA", "reason": ""})
+            for s in exp_sigs:
+                e = expr_by_ticker.get(s["ticker"])
+                if e is None:
+                    continue
                 # Entry-zone Band: BROKEN floor (SMA200) → STRETCHED ceiling
                 # (SMA200 × (1 + extension_pct_cutoff × beta_hint)). SMA200 is
                 # back-derived from the last close and own_extension_pct that
@@ -1803,12 +1886,16 @@ Shown as `"—"` for tickers with fewer than {PARAMS.sma_window} stored bars
                     "Self-check": s["state"],
                     "Self-check reason": s["reason"],
                 }
+                if has_theme_news:
+                    row["Theme news"] = _theme_news_cell(s)
                 if has_notes:
                     row["Note"] = e.note
                 rows.append(row)
             df_rows = pd.DataFrame(rows)
             column_order = ["Ticker", "Label", "Kind", "β hint", "60d",
                             "Band", "Self-check", "Self-check reason"]
+            if has_theme_news:
+                column_order.append("Theme news")
             if has_notes:
                 column_order.append("Note")
             df_rows = df_rows[column_order]
@@ -1850,6 +1937,17 @@ Shown as `"—"` for tickers with fewer than {PARAMS.sma_window} stored bars
                     ),
                     "Self-check reason": st.column_config.TextColumn(
                         "Self-check reason", width="large",
+                    ),
+                    "Theme news": st.column_config.TextColumn(
+                        "Theme news", width="medium",
+                        help=(
+                            "Blended theme sentiment from newsletters + recent "
+                            "headlines (−5..+5). 🔺 positive / 🔻 negative; n = "
+                            "observations. ⚠️ = news contradicts the price trend; "
+                            "👀 = news diverges from a broken chart (watch for a turn). "
+                            "Rows are ordered best-to-buy: technical state first, "
+                            "theme news as the tiebreaker."
+                        ),
                     ),
                 },
             )

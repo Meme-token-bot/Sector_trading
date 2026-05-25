@@ -31,9 +31,29 @@ entirely. Map general themes to the right ETF, e.g. \
 5. `sentiment_score`: integer -5..+5. Use -5/+5 only for unambiguous strong calls.
 6. `reasoning`: quote or paraphrase the author's actual stated reason. Do not invent.
 7. `summary`: 2-3 sentences, neutral, capturing the macro thesis.
+8. `theme_ratings`: ALSO tag any sub-sector THEME from the catalog below that the \
+author explicitly discusses (semiconductors, uranium, biotech, regional banks, etc.). \
+This is independent of `sector_ratings`: a piece may discuss a theme without its parent \
+sector, or vice-versa. Use only `theme_key` values from the catalog; omit themes not \
+addressed; do not fill with zeros. Same -5..+5 scale and quote-the-author rule.
 
-If the input is not a financial/macro piece, return an empty `sector_ratings` \
-list and a brief `summary` noting that."""
+If the input is not a financial/macro piece, return empty `sector_ratings` and \
+`theme_ratings` lists and a brief `summary` noting that.
+
+THEME CATALOG (theme_key — label — example keywords):
+{theme_catalog}"""
+
+
+def _build_theme_catalog() -> str:
+    from config.themes import THEMES
+    lines = []
+    for t in THEMES.values():
+        kws = ", ".join(t.keywords[:5])
+        lines.append(f"- {t.key} — {t.label} — {kws}")
+    return "\n".join(lines)
+
+
+_SYSTEM_PROMPT = _SYSTEM_PROMPT.format(theme_catalog=_build_theme_catalog())
 
 
 _client: OpenAI | None = None
