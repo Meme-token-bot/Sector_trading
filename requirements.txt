@@ -10,3 +10,6 @@ pandas-datareader>=0.10
 plotly>=5.22
 trafilatura>=1.12
 pypdf>=4.3
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
+google-api-python-client>=2.130

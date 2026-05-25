@@ -54,21 +54,30 @@ and subscribe every newsletter there. Two benefits:
 
 ## Connecting Gmail (📧 Inbox tab)
 
-The Inbox tab uses IMAP with a Gmail App Password. Setup:
+The Inbox tab uses the official Gmail REST API with OAuth 2.0. Setup:
 
-1. Enable 2FA on your Google account: https://myaccount.google.com/security
-2. Generate an app password: https://myaccount.google.com/apppasswords
-   - App: **Mail**
-   - Device: **Other** → "sector-rotation"
-   - Copy the 16-character password (Google shows it once).
-3. Edit `.env`:
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/) →
+   create a project → enable the **Gmail API** (APIs & Services → Library).
+2. Create **OAuth 2.0 credentials** of type **Desktop app**
+   (APIs & Services → Credentials → Create credentials → OAuth client ID).
+   Download the client_secret JSON and save it to
+   `credentials/gmail_credentials.json`.
+3. Run the one-time setup script (opens a browser once to authorize):
+   ```bash
+   PYTHONPATH=. python scripts/gmail_oauth_setup.py
+   ```
+   This writes the reusable token to `credentials/gmail_token.json`.
+   The runtime client refreshes it silently — it never opens a browser again.
+4. Set `GMAIL_ADDRESS` and `GMAIL_FILTER_ADDRESS` in `.env` as before:
    ```
    GMAIL_ADDRESS=you@gmail.com
-   GMAIL_APP_PASSWORD=xxxxxxxxxxxxxxxx
    GMAIL_FILTER_ADDRESS=you+macro@gmail.com
    ```
-4. Restart streamlit. Open the Inbox tab → **Test connection** →
-   then **Fetch & parse all**.
+5. Restart streamlit. Open the Inbox tab → **Test connection** →
+   then **Fetch & parse all**. It works exactly as before.
+
+> `credentials/` is git-ignored, so the client secret and token are never
+> committed.
 
 ### What happens on fetch
 

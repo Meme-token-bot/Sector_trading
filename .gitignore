@@ -7,3 +7,4 @@ venv/
 data/*.db
 .streamlit/secrets.toml
 .claude/
+credentials/

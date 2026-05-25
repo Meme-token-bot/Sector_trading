@@ -94,15 +94,18 @@ def tiger_configured() -> bool:
     return all([TIGER_ID, TIGER_ACCOUNT, TIGER_PRIVATE_KEY_PATH,
                 Path(TIGER_PRIVATE_KEY_PATH).exists()])
 
-# --- Gmail -------------------------------------------------------------
+# --- Gmail (Gmail REST API + OAuth 2.0) --------------------------------
 GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 GMAIL_FILTER_ADDRESS = os.getenv("GMAIL_FILTER_ADDRESS", "")
-GMAIL_IMAP_HOST = os.getenv("GMAIL_IMAP_HOST", "imap.gmail.com")
-GMAIL_IMAP_PORT = int(os.getenv("GMAIL_IMAP_PORT", "993"))
+# OAuth client_secret.json downloaded from Google Cloud Console.
+GMAIL_CREDENTIALS_FILE = os.getenv(
+    "GMAIL_CREDENTIALS_FILE", "credentials/gmail_credentials.json")
+# Token (with refresh_token) written by scripts/gmail_oauth_setup.py.
+GMAIL_TOKEN_FILE = os.getenv(
+    "GMAIL_TOKEN_FILE", "credentials/gmail_token.json")
 
 def gmail_configured() -> bool:
-    return bool(GMAIL_ADDRESS and GMAIL_APP_PASSWORD)
+    return bool(GMAIL_ADDRESS and Path(GMAIL_TOKEN_FILE).exists())
 
 # --- Content extraction -------------------------------------------------
 @dataclass(frozen=True)
