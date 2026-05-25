@@ -13,7 +13,8 @@ import pytest
 
 from src.schemas import (
     Allocation, AllocationTilt, MacroNarrative, NewsletterConsensus,
-    RegimeLabel, SectorRecap, WeeklyRecap,
+    RegimeLabel, SectorRecap, SectorWatch, SignalRow, WatchDirection,
+    WeeklyRecap,
 )
 
 
@@ -69,8 +70,9 @@ def _insert_rating(db_path, newsletter_id: int, ticker: str,
 
 def test_gather_context_empty_window(temp_db):
     """No newsletters in the last 7 days → n_newsletters=0, empty lists."""
-    # Patch macro builders to no-op so we don't hit yfinance / FRED.
-    with patch("src.weekly_recap._build_macro_snapshots", return_value=[]):
+    # Patch macro + signal builders to no-op so we don't hit yfinance / FRED.
+    with patch("src.weekly_recap._build_macro_snapshots", return_value=[]), \
+         patch("src.weekly_recap._build_signal_rows", return_value=[]):
         from src.weekly_recap import gather_context
         ctx = gather_context(as_of=date(2026, 5, 23), lookback_days=7)
 
@@ -78,6 +80,7 @@ def test_gather_context_empty_window(temp_db):
     assert ctx.newsletters == []
     assert ctx.sector_rollups == []
     assert ctx.macro_snapshots == []
+    assert ctx.signal_rows == []
     assert ctx.as_of == date(2026, 5, 23)
     assert ctx.lookback_days == 7
 
@@ -106,7 +109,8 @@ def test_gather_context_rollup(temp_db):
                                   "Old thesis.")
     _insert_rating(temp_db, nid_old, "XLK", -5, "Should NOT appear.")
 
-    with patch("src.weekly_recap._build_macro_snapshots", return_value=[]):
+    with patch("src.weekly_recap._build_macro_snapshots", return_value=[]), \
+         patch("src.weekly_recap._build_signal_rows", return_value=[]):
         from src.weekly_recap import gather_context
         ctx = gather_context(as_of=as_of, lookback_days=7)
 
@@ -182,6 +186,25 @@ def test_schema_round_trip():
                 rationale="No newsletter signal — hold tactical only.",
             ),
         ],
+        sectors_to_watch=[
+            SectorWatch(
+                ticker="XLI",
+                sector_name="Industrials",
+                direction=WatchDirection.BUILDING,
+                rationale="Sentiment +2.4 and copper/gold pro-growth, but 3m RS "
+                          "still negative and below leaders — convergence not "
+                          "yet confirmed.",
+                what_to_watch="3-month RS turning positive vs SPY.",
+            ),
+            SectorWatch(
+                ticker="XLK",
+                sector_name="Technology",
+                direction=WatchDirection.ROLLING_OVER,
+                rationale="State CHASE — 25% above SMA200 with a real-yield "
+                          "headwind; extension risk rising.",
+                what_to_watch="Loss of SMA200 or HY OAS widening past 4%.",
+            ),
+        ],
         weekly_summary=(
             "The week tilts late-cycle. Newsletters lean bullish on tech "
             "while flagging credit-spread widening as the canary. Macro "
@@ -198,6 +221,8 @@ def test_schema_round_trip():
     blob = recap.model_dump_json()
     reloaded = WeeklyRecap.model_validate_json(blob)
     assert reloaded == recap
+    assert reloaded.sectors_to_watch[0].direction == WatchDirection.BUILDING
+    assert reloaded.sectors_to_watch[1].direction == WatchDirection.ROLLING_OVER
     # Enum round-trip — values not stringly-typed.
     assert reloaded.macro.regime_label == RegimeLabel.LATE_CYCLE
     assert reloaded.sectors[0].newsletter_consensus == NewsletterConsensus.BULLISH
@@ -294,6 +319,7 @@ def test_generate_recap_with_stub_client(temp_db):
         beta = _StubBeta()
 
     with patch("src.weekly_recap._build_macro_snapshots", return_value=[]), \
+         patch("src.weekly_recap._build_signal_rows", return_value=[]), \
          patch("src.weekly_recap._get_openai_client",
                return_value=_StubClient()):
         from src.weekly_recap import gather_context, generate_recap
@@ -305,3 +331,28 @@ def test_generate_recap_with_stub_client(temp_db):
     # The markdown serialiser should at minimum mention the author and ticker.
     assert "Stub Author" in received_user_content[0]
     assert "XLK" in received_user_content[0]
+
+
+def test_signal_rows_flow_into_context_and_markdown(temp_db):
+    """_build_signal_rows output reaches the context and the markdown table."""
+    fake_rows = [
+        SignalRow(ticker="XLI", above_sma=True, rs_3m_pct=-11.0, rs_rank=8,
+                  sentiment=2.4, state="HOLD", conviction=1,
+                  macro_tailwinds=2, macro_headwinds=0),
+        SignalRow(ticker="XLK", above_sma=True, rs_3m_pct=20.8, rs_rank=2,
+                  sentiment=2.9, state="CHASE", conviction=2,
+                  macro_tailwinds=0, macro_headwinds=1),
+    ]
+    with patch("src.weekly_recap._build_macro_snapshots", return_value=[]), \
+         patch("src.weekly_recap._build_signal_rows", return_value=fake_rows):
+        from src.weekly_recap import gather_context, _format_context_as_markdown
+        ctx = gather_context(as_of=date(2026, 5, 23), lookback_days=7)
+        md = _format_context_as_markdown(ctx)
+
+    assert [r.ticker for r in ctx.signal_rows] == ["XLI", "XLK"]
+    assert "## Signal convergence" in md
+    # The XLI row should render its state and macro tail/head counts.
+    assert "WATCH" not in md or "XLI" in md  # sanity: table present
+    assert "| XLI |" in md
+    assert "2/0" in md  # XLI macro tailwinds/headwinds
+    assert "CHASE" in md

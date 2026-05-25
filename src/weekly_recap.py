@@ -16,14 +16,15 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from config.settings import OPENAI_API_KEY, SECTOR_ETFS
-from src.db import _conn, init_db
+from config.settings import BENCHMARK, OPENAI_API_KEY, SECTOR_ETFS
+from src.db import _conn, aggregate_sentiment, init_db
 from src.market_engine import (
-    copper_gold_ratio, dxy_level, fetch_fred_indicators,
-    fetch_macro_prices, gold_oil_ratio, vix_level, yield_curve_spread,
+    compute_sector_metrics, copper_gold_ratio, dxy_level, fetch_fred_indicators,
+    fetch_macro_prices, fetch_prices, gold_oil_ratio, vix_level,
+    yield_curve_spread,
 )
 from src.schemas import (
-    MacroSnapshot, NewsletterExcerpt, SectorRollup,
+    MacroSnapshot, NewsletterExcerpt, SectorRollup, SignalRow,
     WeeklyRecap, WeeklyRecapContext,
 )
 
@@ -280,6 +281,77 @@ def _build_macro_snapshots() -> list[MacroSnapshot]:
     return out
 
 
+def _macro_readings_for_alignment() -> dict[str, dict]:
+    """Assemble the logical-key macro dict `compute_macro_alignment` expects.
+
+    Mirrors app.py's `_cached_macro_bundle`. Each getter is wrapped so a single
+    upstream failure degrades to "no reading" rather than killing the recap.
+    """
+    try:
+        macro = fetch_macro_prices()
+    except Exception:
+        macro = pd.DataFrame()
+
+    def _safe(fn, *a):
+        try:
+            return fn(*a)
+        except Exception:
+            return {}
+
+    fred = _safe(fetch_fred_indicators)
+    return {
+        "T10Y2Y":         _safe(yield_curve_spread),
+        "HY_OAS":         fred.get("HY_OAS", {}),
+        "UST10":          fred.get("UST10", {}),
+        "REAL_10Y":       fred.get("REAL_10Y", {}),
+        "BREAKEVEN_5Y5Y": fred.get("BREAKEVEN_5Y5Y", {}),
+        "DXY":            _safe(dxy_level, macro) if not macro.empty else {},
+        "VIX":            _safe(vix_level, macro) if not macro.empty else {},
+        "GOLD_OIL":       _safe(gold_oil_ratio, macro) if not macro.empty else {},
+        "COPPER_GOLD":    _safe(copper_gold_ratio, macro) if not macro.empty else {},
+    }
+
+
+def _build_signal_rows(as_of: date) -> list[SignalRow]:
+    """Run the live convergence pipeline and flatten it into SignalRows.
+
+    Reuses the exact dashboard path (prices -> metrics -> sentiment -> signals
+    -> macro alignment -> refined state). Network-dependent, so wrapped: any
+    failure yields an empty list and the recap simply omits the watchlist.
+    """
+    try:
+        from src.macro_alignment import compute_macro_alignment
+        from src.signals import build_signals, refine_signals
+
+        prices = fetch_prices(list(SECTOR_ETFS) + [BENCHMARK])
+        metrics = compute_sector_metrics(prices)
+        sentiment = aggregate_sentiment(as_of=as_of)
+        raw = build_signals(metrics, sentiment)
+        macro_align = compute_macro_alignment(_macro_readings_for_alignment())
+        refined = refine_signals(raw, history=None, macro_alignment=macro_align)
+    except Exception:
+        return []
+
+    rows: list[SignalRow] = []
+    for tkr, r in refined.iterrows():
+        tw = hw = 0
+        if tkr in macro_align.index:
+            tw = int(macro_align.loc[tkr, "tailwinds"] or 0)
+            hw = int(macro_align.loc[tkr, "headwinds"] or 0)
+        rows.append(SignalRow(
+            ticker=str(tkr),
+            above_sma=bool(r.get("above_sma", False)),
+            rs_3m_pct=round(float(r.get("relative_strength_3m", 0.0) or 0.0) * 100, 1),
+            rs_rank=int(r.get("rs_rank", 0) or 0),
+            sentiment=round(float(r.get("sentiment_score", 0.0) or 0.0), 2),
+            state=str(r.get("state", "HOLD")),
+            conviction=int(r.get("conviction", 0) or 0),
+            macro_tailwinds=tw,
+            macro_headwinds=hw,
+        ))
+    return rows
+
+
 def gather_context(as_of: date | None = None,
                    lookback_days: int = 7) -> WeeklyRecapContext:
     """Assemble newsletter + macro context for the recap prompt.
@@ -297,6 +369,7 @@ def gather_context(as_of: date | None = None,
     excerpts = _build_newsletter_excerpts(df)
     rollups = _build_sector_rollups(df)
     macro = _build_macro_snapshots()
+    signal_rows = _build_signal_rows(as_of)
     return WeeklyRecapContext(
         as_of=as_of,
         lookback_days=lookback_days,
@@ -304,6 +377,7 @@ def gather_context(as_of: date | None = None,
         newsletters=excerpts,
         sector_rollups=rollups,
         macro_snapshots=macro,
+        signal_rows=signal_rows,
     )
 
 
@@ -327,6 +401,19 @@ indicator from the supplied context.
 Cover every sector ticker in SECTOR_ETFS. If a sector has no newsletter \
 coverage in the lookback window, say 'no coverage' and lean entirely on the \
 macro read.
+
+`sectors_to_watch` is FORWARD-LOOKING and different from `allocation` \
+(which is what to own now). Anticipate where a convergence gap is about to \
+open or close NEXT week, using the Signal convergence table:
+- "building": sentiment and/or net macro tailwinds support a sector but price \
+has not confirmed yet (not above SMA200, negative 3m RS, or state WATCH/HOLD). \
+These are the sectors most likely to upgrade to a BUY soon.
+- "rolling over": a currently strong sector that is extended (state CHASE) or \
+is losing macro support / facing fresh headwinds — most likely to downgrade.
+Give 2-5 entries, highest-conviction first. Each `rationale` must cite a \
+specific signal-row fact (RS, state, macro tail/head count) PLUS a newsletter \
+or macro reading. `what_to_watch` must name the concrete trigger that confirms \
+the move. Omit a sector entirely (do not force 5) if nothing is set up.
 
 Bias: helpful, decisive, but honest about uncertainty. Avoid hedging \
 language ('it depends', 'time will tell') unless the data genuinely \
@@ -398,6 +485,29 @@ def _format_context_as_markdown(ctx: WeeklyRecapContext) -> str:
               if m.z_or_slope is not None else "—")
         lines.append(f"| {m.name} | {lvl} | {zs} | "
                      f"{m.band_emoji} {m.band_label} |")
+    lines.append("")
+
+    lines.append("## Signal convergence (price + RS + sentiment + macro + state)")
+    if not ctx.signal_rows:
+        lines.append("_Signal pipeline unavailable this run — base the watchlist "
+                     "on newsletters + macro only._")
+    else:
+        lines.append("Use this to spot CONVERGENCE GAPS for `sectors_to_watch`: "
+                     "rows where sentiment/macro support a sector but price "
+                     "(above_sma / RS) hasn't confirmed are 'building'; strong "
+                     "rows that are extended (CHASE) or losing macro support are "
+                     "'rolling over'.")
+        lines.append("")
+        lines.append("| Ticker | Above SMA200 | RS 3m % | RS rank | Sentiment | "
+                     "Macro (tail/head) | State | Conviction |")
+        lines.append("|---|---|---:|---:|---:|---|---|---:|")
+        for s in ctx.signal_rows:
+            lines.append(
+                f"| {s.ticker} | {'yes' if s.above_sma else 'no'} | "
+                f"{s.rs_3m_pct:+.1f} | {s.rs_rank} | {s.sentiment:+.2f} | "
+                f"{s.macro_tailwinds}/{s.macro_headwinds} | {s.state} | "
+                f"{s.conviction}/5 |"
+            )
     lines.append("")
 
     lines.append("## Reference: tickers you must cover")

@@ -74,6 +74,14 @@ class SignalParams:
     # Conviction scoring: relative_strength_3m must exceed this margin
     # (in decimal form, e.g. 0.03 = 3%) to earn the "strong RS" point.
     strong_rs_margin: float = 0.03
+    # Macro overlay (net = tailwinds - headwinds from compute_macro_alignment):
+    #   * conviction reacts to ANY clear lean (net >= +1 / <= -1), symmetric.
+    #   * state veto/override fires only on a STRONG lean (|net| >= this).
+    # Higher = macro must be more one-sided before it downgrades a BUY or
+    # elevates a HOLD to WATCH. At 1 the override fires on any clear net lean,
+    # in step with the conviction nudge (sector rules are now rich enough that
+    # net rarely exceeds ±1 on a normal tape).
+    macro_strong_count: int = 1
 
 PARAMS = SignalParams()
 

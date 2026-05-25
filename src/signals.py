@@ -81,6 +81,24 @@ def build_signals(metrics: pd.DataFrame,
     return df
 
 
+def _macro_net(macro_alignment: pd.DataFrame | None, tkr: str) -> int | None:
+    """Net macro reading for a ticker = tailwinds - headwinds.
+
+    Returns None when no macro frame is supplied or the sector has zero
+    applicable readings (tailwinds + headwinds == 0) — callers must treat
+    None as "no macro opinion" and leave conviction / state untouched.
+    """
+    if macro_alignment is None or macro_alignment.empty:
+        return None
+    if tkr not in macro_alignment.index:
+        return None
+    tw = int(macro_alignment.loc[tkr, "tailwinds"] or 0)
+    hw = int(macro_alignment.loc[tkr, "headwinds"] or 0)
+    if tw + hw == 0:
+        return None
+    return tw - hw
+
+
 def refine_signals(signals: pd.DataFrame,
                    history: pd.DataFrame | None = None,
                    macro_alignment: pd.DataFrame | None = None) -> pd.DataFrame:
@@ -162,9 +180,46 @@ def refine_signals(signals: pd.DataFrame,
     out["state"] = states
     out["state_reason"] = state_reasons
 
-    # ----- Conviction score (0..5; 0..4 when no macro frame supplied) -----
-    # Each component contributes at most +1. Macro alignment is optional —
-    # when absent the component scores 0 and the practical max is 4.
+    # ----- Macro veto / override pass -----------------------------------
+    # Macro can CUT risk freely but cannot ADD unconfirmed price risk:
+    #   NEW_BUY      + strong headwind -> HOLD   (veto: drops from target_weights)
+    #   HOLD_IF_LONG + strong headwind -> REDUCE (trim a stale BUY)
+    #   HOLD         + strong tailwind -> WATCH  (only if above_sma; no capital)
+    # SELL/CHASE and any sector with no macro opinion are left untouched.
+    # WATCH is deliberately excluded from target_weights — price hasn't
+    # confirmed, so it's a visibility flag, not a position.
+    thr = PARAMS.macro_strong_count
+    new_states = list(out["state"])
+    new_reasons = list(out["state_reason"])
+    for i, (tkr, row) in enumerate(out.iterrows()):
+        net = _macro_net(macro_alignment, tkr)
+        if net is None:
+            continue
+        tw = int(macro_alignment.loc[tkr, "tailwinds"] or 0)
+        hw = int(macro_alignment.loc[tkr, "headwinds"] or 0)
+        st = new_states[i]
+        if net <= -thr and st == "NEW_BUY":
+            new_states[i] = "HOLD"
+            new_reasons[i] = (f"macro veto: {hw} headwinds vs {tw} tailwinds "
+                              f"— defer fresh entry")
+        elif net <= -thr and st == "HOLD_IF_LONG":
+            new_states[i] = "REDUCE"
+            new_reasons[i] = (f"macro headwind ({hw} vs {tw}) on a stale BUY "
+                              f"— trim if owned")
+        elif net >= thr and st == "HOLD" and bool(row.get("above_sma", False)):
+            new_states[i] = "WATCH"
+            new_reasons[i] = (f"sentiment+macro support ({tw} tailwinds vs {hw} "
+                              f"headwinds), price not yet confirmed — watch for RS turn")
+    out["state"] = new_states
+    out["state_reason"] = new_reasons
+
+    # ----- Conviction score (0..5) -----
+    # Each non-macro component contributes at most +1. The macro component is
+    # graded and SYMMETRIC: a clear net tailwind adds +1, a clear net headwind
+    # subtracts 1 (a sector fighting the macro tape loses conviction). The
+    # final score is clamped to [0, 5] so the 5-dot display still renders;
+    # the clamp can pull a sector below its trend/sentiment baseline but never
+    # negative. When no macro frame is supplied the macro component is 0.
     convictions: list[int] = []
     for tkr, row in out.iterrows():
         score = 0
@@ -179,12 +234,17 @@ def refine_signals(signals: pd.DataFrame,
         n_buy = int(row.get("consecutive_buy_weeks", 0) or 0)
         if n_buy >= 2:
             score += 1
-        if macro_alignment is not None and not macro_alignment.empty:
-            if tkr in macro_alignment.index:
-                ratio = float(macro_alignment.loc[tkr, "ratio"] or 0.0)
-                if ratio >= 0.5:
-                    score += 1
-        convictions.append(score)
+        # Conviction reacts to ANY clear macro lean (net >= +1 / <= -1) — a
+        # finer bar than the state override below, which needs a STRONG lean
+        # (macro_strong_count). This keeps conviction responsive while reserving
+        # the disruptive veto/override for unambiguous macro signals.
+        net = _macro_net(macro_alignment, tkr)
+        if net is not None:
+            if net >= 1:
+                score += 1
+            elif net <= -1:
+                score -= 1
+        convictions.append(max(0, min(5, score)))
 
     out["conviction"] = convictions
     return out

@@ -44,12 +44,18 @@ from config.settings import SECTOR_ETFS
 MacroPayload = dict[str, Any]
 
 
-def _value(readings: dict[str, MacroPayload], key: str) -> float | None:
-    """Pull the `current` reading for `key`, or None if missing / NaN."""
+def _value(readings: dict[str, MacroPayload], key: str,
+           field: str = "current") -> float | None:
+    """Pull `field` (default "current") for `key`, or None if missing / NaN.
+
+    Some indicators are only meaningful as a z-score, not a raw level — e.g.
+    the copper/gold ratio sits near 0.0014, so a level threshold is useless;
+    rules for it read `z_score_1y` instead.
+    """
     payload = readings.get(key)
     if payload is None:
         return None
-    val = payload.get("current")
+    val = payload.get(field)
     if val is None:
         return None
     try:
@@ -61,10 +67,12 @@ def _value(readings: dict[str, MacroPayload], key: str) -> float | None:
     return fval
 
 
-# A rule is (indicator_key, predicate_on_value, verdict, label_for_detail).
-# predicate returns True iff the indicator's `current` reading currently
+# A rule is (indicator_key, predicate_on_value, verdict, label_for_detail)
+# with an OPTIONAL 5th element naming the payload field the predicate reads
+# (default "current"). predicate returns True iff the reading currently
 # applies. `verdict` is one of {"tailwind", "headwind", "neutral"}.
-Rule = tuple[str, Callable[[float], bool], str, str]
+Rule = tuple[str, Callable[[float], bool], str, str] | \
+       tuple[str, Callable[[float], bool], str, str, str]
 
 
 def _gt(threshold: float) -> Callable[[float], bool]:
@@ -80,70 +88,93 @@ def _lt(threshold: float) -> Callable[[float], bool]:
 # the magnitudes mirror the bands used elsewhere in the dashboard (the
 # Macro tab's _VIX_BANDS, _HY_OAS_BANDS, etc).
 SECTOR_MACRO_MAP: dict[str, list[Rule]] = {
-    # Financials — yield curve steepening + benign credit help NIMs.
+    # Financials — yield curve steepening, higher nominal rates, and benign
+    # credit all help NIMs.
     "XLF": [
         ("T10Y2Y", _gt(0.5),  "tailwind",  "T10Y2Y > +0.5 (steep curve helps NIM)"),
         ("T10Y2Y", _lt(0.0),  "headwind",  "T10Y2Y inverted (NIM pressure)"),
         ("HY_OAS", _lt(4.0),  "tailwind",  "HY OAS < 4% (credit benign)"),
         ("HY_OAS", _gt(5.0),  "headwind",  "HY OAS > 5% (credit stress)"),
+        ("UST10",  _gt(4.0),  "tailwind",  "10Y > 4% (higher rates lift NIM)"),
+        ("UST10",  _lt(3.0),  "headwind",  "10Y < 3% (low rates squeeze NIM)"),
     ],
-    # Energy — weak USD + oil-rich gold/oil ratio = supportive.
+    # Energy — weak USD, oil-rich gold/oil ratio, and reflation = supportive.
     "XLE": [
-        ("DXY",      _lt(100.0), "tailwind", "DXY < 100 (weak USD lifts crude)"),
-        ("DXY",      _gt(105.0), "headwind", "DXY > 105 (strong USD weighs on crude)"),
-        ("GOLD_OIL", _lt(15.0),  "tailwind", "Gold/Oil < 15 (oil rich vs gold)"),
-        ("GOLD_OIL", _gt(30.0),  "headwind", "Gold/Oil > 30 (oil cheap vs gold)"),
+        ("DXY",            _lt(100.0), "tailwind", "DXY < 100 (weak USD lifts crude)"),
+        ("DXY",            _gt(105.0), "headwind", "DXY > 105 (strong USD weighs on crude)"),
+        ("GOLD_OIL",       _lt(15.0),  "tailwind", "Gold/Oil < 15 (oil rich vs gold)"),
+        ("GOLD_OIL",       _gt(30.0),  "headwind", "Gold/Oil > 30 (oil cheap vs gold)"),
+        ("COPPER_GOLD",    _gt(0.5),   "tailwind", "Copper/Gold z > +0.5 (reflation lifts demand)", "z_score_1y"),
+        ("BREAKEVEN_5Y5Y", _gt(2.5),   "tailwind", "Breakevens > 2.5% (inflation supports commodities)"),
     ],
     # Technology — long-duration cashflow assets; sensitive to real rates,
-    # USD, and risk sentiment.
+    # USD, risk sentiment, and the credit that funds growth.
     "XLK": [
         ("REAL_10Y", _gt(2.0),   "headwind", "Real 10Y > 2% (duration discount)"),
         ("REAL_10Y", _lt(1.0),   "tailwind", "Real 10Y < 1% (duration support)"),
         ("DXY",      _gt(105.0), "headwind", "DXY > 105 (offshore-rev FX drag)"),
         ("VIX",      _gt(25.0),  "headwind", "VIX > 25 (risk-off de-rates growth)"),
+        ("HY_OAS",   _lt(4.0),   "tailwind", "HY OAS < 4% (risk-on credit funds growth)"),
+        ("HY_OAS",   _gt(5.0),   "headwind", "HY OAS > 5% (risk-off de-rates growth)"),
     ],
     # Communication Services — mega-cap growth profile similar to XLK.
     "XLC": [
         ("REAL_10Y", _gt(2.0),   "headwind", "Real 10Y > 2% (duration discount)"),
         ("REAL_10Y", _lt(1.0),   "tailwind", "Real 10Y < 1% (duration support)"),
         ("VIX",      _gt(25.0),  "headwind", "VIX > 25 (risk-off)"),
+        ("HY_OAS",   _lt(4.0),   "tailwind", "HY OAS < 4% (risk-on credit)"),
+        ("HY_OAS",   _gt(5.0),   "headwind", "HY OAS > 5% (risk-off)"),
+        ("DXY",      _gt(105.0), "headwind", "DXY > 105 (offshore ad-rev FX drag)"),
     ],
-    # Consumer Discretionary — cyclical, sensitive to credit & vol regime.
+    # Consumer Discretionary — cyclical, sensitive to credit, vol, and the
+    # financing cost of big-ticket purchases.
     "XLY": [
-        ("HY_OAS", _lt(4.0), "tailwind", "HY OAS < 4% (consumer credit OK)"),
-        ("HY_OAS", _gt(5.0), "headwind", "HY OAS > 5% (consumer stress)"),
-        ("VIX",    _gt(25.0), "headwind", "VIX > 25 (cyclical de-rate)"),
-        ("T10Y2Y", _lt(0.0),  "headwind", "Curve inverted (late cycle)"),
+        ("HY_OAS",   _lt(4.0), "tailwind", "HY OAS < 4% (consumer credit OK)"),
+        ("HY_OAS",   _gt(5.0), "headwind", "HY OAS > 5% (consumer stress)"),
+        ("VIX",      _gt(25.0), "headwind", "VIX > 25 (cyclical de-rate)"),
+        ("T10Y2Y",   _lt(0.0),  "headwind", "Curve inverted (late cycle)"),
+        ("REAL_10Y", _gt(2.0),  "headwind", "Real 10Y > 2% (financing drag on big-ticket)"),
     ],
-    # Industrials — global cyclicals tied to growth proxy & USD.
+    # Industrials — global cyclicals tied to the growth proxy, USD & cycle.
     "XLI": [
-        ("COPPER_GOLD", _gt(0.20), "tailwind", "Copper/Gold high (pro-growth)"),
-        ("DXY",          _gt(105.0), "headwind", "DXY > 105 (export drag)"),
-        ("HY_OAS",       _gt(5.0),   "headwind", "HY OAS > 5% (capex risk)"),
+        ("COPPER_GOLD",    _gt(0.5),   "tailwind", "Copper/Gold z > +0.5 (pro-growth)", "z_score_1y"),
+        ("COPPER_GOLD",    _lt(-0.5),  "headwind", "Copper/Gold z < -0.5 (deflationary)", "z_score_1y"),
+        ("DXY",            _gt(105.0), "headwind", "DXY > 105 (export drag)"),
+        ("HY_OAS",         _gt(5.0),   "headwind", "HY OAS > 5% (capex risk)"),
+        ("T10Y2Y",         _lt(0.0),   "headwind", "Curve inverted (late-cycle capex risk)"),
+        ("BREAKEVEN_5Y5Y", _gt(2.5),   "tailwind", "Breakevens > 2.5% (reflationary demand)"),
     ],
-    # Materials — global cyclicals; same drivers as industrials.
+    # Materials — global cyclicals; reflation + weak USD are the key drivers.
     "XLB": [
-        ("COPPER_GOLD", _gt(0.20), "tailwind", "Copper/Gold high (pro-growth)"),
-        ("DXY",          _lt(100.0), "tailwind", "DXY < 100 (commodity tailwind)"),
-        ("DXY",          _gt(105.0), "headwind", "DXY > 105 (commodity headwind)"),
+        ("COPPER_GOLD",    _gt(0.5),   "tailwind", "Copper/Gold z > +0.5 (pro-growth)", "z_score_1y"),
+        ("COPPER_GOLD",    _lt(-0.5),  "headwind", "Copper/Gold z < -0.5 (deflationary)", "z_score_1y"),
+        ("DXY",            _lt(100.0), "tailwind", "DXY < 100 (commodity tailwind)"),
+        ("DXY",            _gt(105.0), "headwind", "DXY > 105 (commodity headwind)"),
+        ("BREAKEVEN_5Y5Y", _gt(2.5),   "tailwind", "Breakevens > 2.5% (inflation lifts commodities)"),
     ],
-    # Health Care — defensive; rises with stress and risk-off.
+    # Health Care — defensive; bid in stress, but risk-on rotates out of it.
     "XLV": [
-        ("VIX",    _gt(25.0), "tailwind", "VIX > 25 (defensive bid)"),
-        ("HY_OAS", _gt(5.0),  "tailwind", "HY OAS > 5% (rotate to defensives)"),
+        ("VIX",    _gt(25.0),  "tailwind", "VIX > 25 (defensive bid)"),
+        ("VIX",    _lt(15.0),  "headwind", "VIX < 15 (risk-on rotates out of defensives)"),
+        ("HY_OAS", _gt(5.0),   "tailwind", "HY OAS > 5% (rotate to defensives)"),
+        ("DXY",    _gt(105.0), "headwind", "DXY > 105 (big-pharma offshore-rev FX drag)"),
     ],
-    # Consumer Staples — defensive; benefit from rate-cut expectations & risk-off.
+    # Consumer Staples — defensive bond-proxy; risk-on and strong USD weigh.
     "XLP": [
-        ("VIX",      _gt(25.0), "tailwind", "VIX > 25 (defensive bid)"),
-        ("REAL_10Y", _lt(1.0),  "tailwind", "Real 10Y < 1% (bond-proxy supportive)"),
-        ("REAL_10Y", _gt(2.0),  "headwind", "Real 10Y > 2% (bond-proxy hurts)"),
+        ("VIX",      _gt(25.0),  "tailwind", "VIX > 25 (defensive bid)"),
+        ("VIX",      _lt(15.0),  "headwind", "VIX < 15 (risk-on rotates out of staples)"),
+        ("REAL_10Y", _lt(1.0),   "tailwind", "Real 10Y < 1% (bond-proxy supportive)"),
+        ("REAL_10Y", _gt(2.0),   "headwind", "Real 10Y > 2% (bond-proxy hurts)"),
+        ("DXY",      _gt(105.0), "headwind", "DXY > 105 (staples multinational FX drag)"),
     ],
-    # Utilities — bond proxy.
+    # Utilities — bond proxy; hurt by high rates and risk-on rotation.
     "XLU": [
         ("REAL_10Y", _lt(1.0),  "tailwind", "Real 10Y < 1% (bond-proxy supportive)"),
         ("REAL_10Y", _gt(2.0),  "headwind", "Real 10Y > 2% (bond-proxy hurts)"),
         ("T10Y2Y",   _lt(0.0),  "neutral",  "Curve inverted (rate-cut path)"),
         ("VIX",      _gt(25.0), "tailwind", "VIX > 25 (defensive bid)"),
+        ("VIX",      _lt(15.0), "headwind", "VIX < 15 (risk-on rotates out of defensives)"),
+        ("UST10",    _gt(5.0),  "headwind", "10Y > 5% (bond-proxy competition)"),
     ],
     # Real Estate — rate sensitive, bond proxy.
     "XLRE": [
@@ -151,13 +182,16 @@ SECTOR_MACRO_MAP: dict[str, list[Rule]] = {
         ("REAL_10Y", _gt(2.0),  "headwind", "Real 10Y > 2% (cap-rate pressure)"),
         ("T10Y2Y",   _lt(0.0),  "neutral",  "Curve inverted (rate-cut path)"),
         ("HY_OAS",   _gt(5.0),  "headwind", "HY OAS > 5% (refi stress)"),
+        ("UST10",    _gt(5.0),  "headwind", "10Y > 5% (mortgage / cap-rate pressure)"),
     ],
-    # Space (supplementary thematic) — high-beta speculative; needs risk-on.
+    # Space (supplementary thematic) — high-beta speculative long-duration;
+    # needs risk-on and low real rates.
     "UFO": [
-        ("VIX",    _lt(15.0), "tailwind", "VIX < 15 (risk-on supports thematics)"),
-        ("VIX",    _gt(25.0), "headwind", "VIX > 25 (risk-off crushes thematics)"),
-        ("HY_OAS", _lt(4.0),  "tailwind", "HY OAS < 4% (risk-on credit)"),
-        ("HY_OAS", _gt(5.0),  "headwind", "HY OAS > 5% (risk-off credit)"),
+        ("VIX",      _lt(15.0), "tailwind", "VIX < 15 (risk-on supports thematics)"),
+        ("VIX",      _gt(25.0), "headwind", "VIX > 25 (risk-off crushes thematics)"),
+        ("HY_OAS",   _lt(4.0),  "tailwind", "HY OAS < 4% (risk-on credit)"),
+        ("HY_OAS",   _gt(5.0),  "headwind", "HY OAS > 5% (risk-off credit)"),
+        ("REAL_10Y", _gt(2.0),  "headwind", "Real 10Y > 2% (crushes long-duration speculative growth)"),
     ],
 }
 
@@ -182,8 +216,10 @@ def compute_macro_alignment(
         rules = SECTOR_MACRO_MAP.get(sector, [])
         tailwinds = headwinds = neutral = 0
         detail: list[tuple[str, str]] = []
-        for indicator_key, predicate, verdict, label in rules:
-            val = _value(macro_readings, indicator_key)
+        for rule in rules:
+            indicator_key, predicate, verdict, label = rule[:4]
+            field = rule[4] if len(rule) > 4 else "current"
+            val = _value(macro_readings, indicator_key, field)
             if val is None:
                 continue
             if not predicate(val):

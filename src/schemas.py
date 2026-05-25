@@ -90,6 +90,11 @@ class RegimeLabel(str, Enum):
     MIXED = "Mixed"
 
 
+class WatchDirection(str, Enum):
+    BUILDING = "building"          # support gathering ahead of a price confirm
+    ROLLING_OVER = "rolling over"  # currently strong but at risk of topping
+
+
 # --- input side (not sent to OpenAI as response_format) ---
 
 class NewsletterExcerpt(BaseModel):
@@ -119,6 +124,23 @@ class MacroSnapshot(BaseModel):
     band_emoji: str = "⚪"
 
 
+class SignalRow(BaseModel):
+    """Per-sector convergence snapshot (trend + RS + sentiment + macro + state).
+
+    Lets the recap reason about *gaps* between the layers — e.g. sentiment and
+    macro support a sector but price (RS / SMA200) hasn't confirmed yet.
+    """
+    ticker: str
+    above_sma: bool
+    rs_3m_pct: float            # 3-month relative strength vs benchmark, in %
+    rs_rank: int
+    sentiment: float            # mean newsletter sentiment in the window
+    state: str                  # NEW_BUY / HOLD_IF_LONG / CHASE / REDUCE / WATCH / HOLD / SELL
+    conviction: int             # 0-5
+    macro_tailwinds: int
+    macro_headwinds: int
+
+
 class WeeklyRecapContext(BaseModel):
     """Assembled input for generate_recap()."""
     as_of: date
@@ -127,6 +149,7 @@ class WeeklyRecapContext(BaseModel):
     newsletters: list[NewsletterExcerpt] = Field(default_factory=list)
     sector_rollups: list[SectorRollup] = Field(default_factory=list)
     macro_snapshots: list[MacroSnapshot] = Field(default_factory=list)
+    signal_rows: list[SignalRow] = Field(default_factory=list)
 
 
 # --- output side (response_format) ---
@@ -178,6 +201,32 @@ class Allocation(BaseModel):
     )
 
 
+class SectorWatch(BaseModel):
+    """Forward-looking flag for a sector worth watching next week.
+
+    Unlike `Allocation` (what to own now), this anticipates a *change*: a
+    convergence gap that is about to open or close.
+    """
+    ticker: SectorTicker
+    sector_name: str
+    direction: WatchDirection
+    rationale: str = Field(
+        ..., max_length=400,
+        description="Why this sector is on the watchlist. Must cite the "
+                    "convergence GAP from the signal rows — e.g. sentiment and "
+                    "macro support it but RS/price haven't confirmed (building), "
+                    "or it's strong but extended / macro is turning (rolling over). "
+                    "Reference at least one signal-row fact plus a newsletter or "
+                    "macro reading.",
+    )
+    what_to_watch: str = Field(
+        ..., max_length=200,
+        description="The concrete trigger that would confirm the move, e.g. "
+                    "'3-month RS turning positive', 'reclaim of SMA200', "
+                    "'HY OAS widening past 4%'.",
+    )
+
+
 class WeeklyRecap(BaseModel):
     """Structured response from gpt-4o-mini for the Weekly Recap tab.
 
@@ -200,6 +249,14 @@ class WeeklyRecap(BaseModel):
     allocation: list[Allocation] = Field(
         default_factory=list,
         description="Ranked, highest-conviction tilts first.",
+    )
+    sectors_to_watch: list[SectorWatch] = Field(
+        default_factory=list,
+        description="2-5 forward-looking watch flags. Anticipate where a "
+                    "convergence gap is about to open or close next week — not "
+                    "what to own now (that's `allocation`). Omit (empty list) "
+                    "only if nothing is set up. Declared before weekly_summary "
+                    "so the summary can reference these.",
     )
     weekly_summary: str = Field(
         ..., max_length=1500,

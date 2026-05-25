@@ -504,10 +504,10 @@ with tab_dashboard:
         )
 
         st.caption("State distribution")
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        _state_cols = st.columns(7)
         for col, state in zip(
-            [c1, c2, c3, c4, c5, c6],
-            ["NEW_BUY", "HOLD_IF_LONG", "CHASE", "REDUCE", "HOLD", "SELL"],
+            _state_cols,
+            ["NEW_BUY", "HOLD_IF_LONG", "CHASE", "REDUCE", "WATCH", "HOLD", "SELL"],
         ):
             col.metric(state, int((signals["state"] == state).sum()))
 
@@ -577,8 +577,13 @@ with tab_dashboard:
   {PARAMS.extension_pct_cutoff*100:.0f}% above SMA200. **Too extended for fresh entry.**
   Wait for a pullback to the SMA before considering.
 - 🟤 **REDUCE** — was BUY in the last {PARAMS.history_weeks} weeks but no longer
-  qualifies (sentiment cooled, RS turned, etc.). **Trim if owned.**
-- ⚪ **HOLD** — doesn't qualify as BUY and never did recently. **Wait and see.**
+  qualifies (sentiment cooled, RS turned, etc.), **or** a stale BUY now facing a
+  strong macro headwind. **Trim if owned.**
+- 🔭 **WATCH** — not a BUY yet (price hasn't confirmed), but sentiment and the
+  macro tape both support it (net ≥ {PARAMS.macro_strong_count} tailwinds). **No
+  position — watch for the RS turn / SMA200 reclaim.**
+- ⚪ **HOLD** — doesn't qualify as BUY and never did recently, **or** a would-be
+  fresh BUY that a strong macro headwind vetoed. **Wait and see.**
 - 🔴 **SELL** — fails one of the hard SELL rules (price < SMA200,
   bottom-3 RS rank, or sentiment ≤ {PARAMS.sell_sentiment_threshold:+.0f}). **Exit.**
 
@@ -947,6 +952,24 @@ with tab_recap:
                         st.markdown("**Key risks**")
                         for r in s.key_risks:
                             st.markdown(f"- {r}")
+
+            # ---- Sectors to watch (forward-looking) ----
+            watch = getattr(recap, "sectors_to_watch", None) or []
+            if watch:
+                section("🔭 Sectors to watch", level=3)
+                st.caption(
+                    "Forward-looking — where a convergence gap may open or close "
+                    "next week. Not positions to take now (see allocation below)."
+                )
+                _dir_emoji = {"building": "🌱", "rolling over": "🍂"}
+                for w in watch:
+                    direction = w.direction.value
+                    emoji = _dir_emoji.get(direction, "🔭")
+                    st.markdown(
+                        f"{emoji} **{w.ticker} — {w.sector_name}** · _{direction}_"
+                    )
+                    st.markdown(w.rationale)
+                    st.markdown(f"**Watch for:** {w.what_to_watch}")
 
             # ---- Allocation table ----
             section("📊 Allocation tilts", level=3)

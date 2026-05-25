@@ -24,6 +24,7 @@ STATE_COLORS: dict[str, str] = {
     "HOLD_IF_LONG": "#3d3a14",  # amber — hold if owned, don't add
     "CHASE":        "#4a3214",  # orange — too late, don't enter
     "REDUCE":       "#3d1f14",  # rust — was BUY, now degraded
+    "WATCH":        "#14323d",  # teal — macro+sentiment support, price unconfirmed
     "HOLD":         "",         # neutral — wait
     "SELL":         "#4a1818",  # red — exit
 }
@@ -35,6 +36,7 @@ STATE_ACCENTS: dict[str, str] = {
     "HOLD_IF_LONG": "#f1c40f",
     "CHASE":        "#e67e22",
     "REDUCE":       "#c97c5d",
+    "WATCH":        "#3aa6c4",
     "HOLD":         "#888888",
     "SELL":         "#e74c3c",
 }
