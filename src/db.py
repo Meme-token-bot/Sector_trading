@@ -298,7 +298,7 @@ def recent_newsletters(limit: int = 25) -> pd.DataFrame:
     with _conn() as c:
         return pd.read_sql_query(
             """SELECT id, author, publication_date, overall_macro_bias,
-                      substr(summary, 1, 200) AS summary, ingested_at
+                      summary, ingested_at
                FROM newsletters
                ORDER BY publication_date DESC, ingested_at DESC
                LIMIT ?""",

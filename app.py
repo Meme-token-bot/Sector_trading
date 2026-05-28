@@ -2237,7 +2237,23 @@ with tab_history:
     if hist.empty:
         st.info("No newsletters ingested yet. Use the Ingest tab.")
     else:
-        st.dataframe(hist, use_container_width=True, height=320)
+        st.caption(
+            f"{len(hist)} newsletter{'s' if len(hist) != 1 else ''} — "
+            "expand a row to read its full summary."
+        )
+        for _, nl in hist.iterrows():
+            bias = nl["overall_macro_bias"] or "—"
+            label = (
+                f"#{int(nl['id'])} · {nl['publication_date']} · "
+                f"{nl['author']}  —  {bias}"
+            )
+            with st.expander(label):
+                summary = (nl["summary"] or "").strip()
+                if summary:
+                    st.markdown(summary)
+                else:
+                    st.caption("_No summary stored for this newsletter._")
+                st.caption(f"Ingested {nl['ingested_at']}")
         with st.expander("🗑 Delete an entry"):
             ids = hist["id"].tolist()
             target_id = st.selectbox("Newsletter id to delete", ids)
