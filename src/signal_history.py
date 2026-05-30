@@ -203,68 +203,90 @@ def signal_performance_vs_benchmark(
     prices: dict[str, pd.Series],
     benchmark_ticker: str = "SPY",
     weeks: int = 12,
+    horizon: str = "next_state_exit",
+    source: str = "auto",
 ) -> dict:
-    """Forward 1-week excess return for sectors flagged NEW_BUY/BUY in history.
+    """Forward excess return of refined NEW_BUY signals vs the benchmark.
 
-    For each weekly snapshot in the trailing `weeks` window, identify
-    sectors whose raw signal == 'BUY' (the closest analogue of NEW_BUY in
-    the persisted history frame, which stores raw labels) and compute the
-    sector's forward 1-week return vs the benchmark's forward 1-week
-    return. Returns aggregates and a per-state breakdown.
+    Reads persisted refined states from ``signal_snapshots`` first; falls
+    back to scanning the in-memory `history` frame (which carries raw labels
+    only) when the persisted table is empty — useful before any snapshots
+    have been written.
 
-    `prices` is a mapping ticker -> close Series indexed by date. Forward
-    returns are computed by stepping ~5 trading days (one calendar week)
-    after each snapshot date.
+    `horizon` controls how long each signal is held:
+      * "next_state_exit" (default) — hold from the snapshot date until the
+        first subsequent snapshot where the ticker's state leaves the BUY
+        class (SELL/REDUCE/HOLD/CHASE). This matches the live "hold until
+        state change" rule, so the headline number reflects the strategy's
+        actual P&L profile rather than an arbitrary 1-week clip.
+      * "1w" — legacy fixed 1-week horizon. Faster to compute and what the
+        UI used to claim it was showing.
 
     Returns:
       {
         n_signals: int,
         mean_excess_return: float,
         hit_rate: float,
+        median_hold_days: float | None,
         by_state: {state: {n, mean_excess_return, hit_rate}},
+        horizon: str,
+        source: "snapshots" | "history",
       }
-    Returns {n_signals: 0, mean_excess_return: 0.0, hit_rate: 0.0, by_state: {}}
-    if `history` is shorter than 4 weeks.
     """
     empty = {
         "n_signals": 0,
         "mean_excess_return": 0.0,
         "hit_rate": 0.0,
+        "median_hold_days": None,
         "by_state": {},
+        "horizon": horizon,
+        "source": "none",
     }
-    if history is None or history.empty or len(history) < 4:
-        return empty
     if benchmark_ticker not in prices:
         return empty
-
     bench = prices[benchmark_ticker].dropna()
     if bench.empty:
         return empty
 
-    window = history.tail(weeks)
-    records: list[tuple[str, float]] = []  # (state_label, excess_return)
+    # ---- Source selection -------------------------------------------------
+    # 'auto'     : prefer persisted snapshots (the strict NEW_BUY record);
+    #              fall back to raw history when the table is empty.
+    # 'snapshots': read snapshots only (return empty if missing).
+    # 'history'  : ignore snapshots entirely and use the in-memory `history`
+    #              frame (raw BUY/HOLD/SELL labels). Useful in tests that
+    #              fabricate a history but don't write snapshots.
+    if source == "history":
+        snaps = pd.DataFrame()
+    else:
+        from src.db import load_signal_snapshots
+        snaps = load_signal_snapshots()
+        if snaps.empty and source == "snapshots":
+            return {**empty, "source": "snapshots"}
+    if not snaps.empty:
+        # Build a date-indexed refined-state frame from snapshots, then
+        # apply the same trailing-`weeks` clip used by the UI.
+        wide = snaps.pivot(index="as_of", columns="ticker", values="state").sort_index()
+        wide = wide.tail(weeks)
+        source = "snapshots"
+        is_new_buy = lambda v: isinstance(v, str) and v == "NEW_BUY"  # noqa: E731
+    else:
+        if history is None or history.empty or len(history) < 4:
+            return empty
+        wide = history.tail(weeks)
+        source = "history"
+        # raw history carries only BUY/HOLD/SELL — accept either label as the
+        # NEW_BUY proxy until snapshots exist.
+        is_new_buy = lambda v: isinstance(v, str) and v in ("BUY", "NEW_BUY")  # noqa: E731
 
-    for snap_date, row in window.iterrows():
+    records: list[dict] = []  # {state, excess, hold_days}
+
+    snap_dates = list(wide.index)
+    for i, snap_date in enumerate(snap_dates):
+        row = wide.loc[snap_date]
         snap_ts = pd.Timestamp(snap_date)
-        # Forward 1-week point (~5 trading days). Find the first trading
-        # day >= snap_ts (entry) and the first trading day >= snap_ts + 7d
-        # (exit). Skip if either window-end falls outside available bars.
-        b_idx_entry = bench.index.searchsorted(snap_ts, side="left")
-        b_idx_exit = bench.index.searchsorted(snap_ts + pd.Timedelta(days=7), side="left")
-        if b_idx_entry >= len(bench) or b_idx_exit >= len(bench):
-            continue
-        if b_idx_exit <= b_idx_entry:
-            continue
-        b_entry = float(bench.iloc[b_idx_entry])
-        b_exit = float(bench.iloc[b_idx_exit])
-        if b_entry == 0:
-            continue
-        bench_fwd = b_exit / b_entry - 1.0
 
         for ticker, label in row.items():
-            if not isinstance(label, str):
-                continue
-            if label not in ("BUY", "NEW_BUY"):
+            if not is_new_buy(label):
                 continue
             s = prices.get(ticker)
             if s is None:
@@ -272,41 +294,68 @@ def signal_performance_vs_benchmark(
             s = s.dropna()
             if s.empty:
                 continue
-            s_idx_entry = s.index.searchsorted(snap_ts, side="left")
-            s_idx_exit = s.index.searchsorted(snap_ts + pd.Timedelta(days=7), side="left")
-            if s_idx_entry >= len(s) or s_idx_exit >= len(s):
+
+            # Entry bar: first trading day >= snap_date.
+            s_entry_i = s.index.searchsorted(snap_ts, side="left")
+            b_entry_i = bench.index.searchsorted(snap_ts, side="left")
+            if s_entry_i >= len(s) or b_entry_i >= len(bench):
                 continue
-            if s_idx_exit <= s_idx_entry:
+
+            # Exit bar: depends on horizon.
+            if horizon == "1w":
+                exit_ts = snap_ts + pd.Timedelta(days=7)
+            else:  # next_state_exit
+                exit_ts = None
+                for j in range(i + 1, len(snap_dates)):
+                    nxt_label = wide.loc[snap_dates[j], ticker]
+                    if isinstance(nxt_label, str) and nxt_label not in (
+                            "NEW_BUY", "HOLD_IF_LONG", "BUY"):
+                        exit_ts = pd.Timestamp(snap_dates[j])
+                        break
+                if exit_ts is None:
+                    # Still in BUY class as of the latest snapshot — mark to
+                    # the last available bar so live positions still count.
+                    exit_ts = s.index[-1]
+
+            s_exit_i = s.index.searchsorted(exit_ts, side="left")
+            b_exit_i = bench.index.searchsorted(exit_ts, side="left")
+            if s_exit_i >= len(s):
+                s_exit_i = len(s) - 1
+            if b_exit_i >= len(bench):
+                b_exit_i = len(bench) - 1
+            if s_exit_i <= s_entry_i or b_exit_i <= b_entry_i:
                 continue
-            entry = float(s.iloc[s_idx_entry])
-            exit_ = float(s.iloc[s_idx_exit])
-            if entry == 0:
+
+            s_e, s_x = float(s.iloc[s_entry_i]), float(s.iloc[s_exit_i])
+            b_e, b_x = float(bench.iloc[b_entry_i]), float(bench.iloc[b_exit_i])
+            if s_e == 0 or b_e == 0:
                 continue
-            fwd = exit_ / entry - 1.0
-            excess = fwd - bench_fwd
-            records.append((label, excess))
+            excess = (s_x / s_e - 1.0) - (b_x / b_e - 1.0)
+            hold_days = (s.index[s_exit_i] - s.index[s_entry_i]).days
+            records.append({"state": str(label), "excess": excess,
+                             "hold_days": hold_days})
 
     if not records:
-        return empty
+        return {**empty, "source": source}
 
-    arr = np.array([r[1] for r in records], dtype=float)
+    arr = np.array([r["excess"] for r in records], dtype=float)
     n = int(arr.size)
-    mean_ex = float(arr.mean())
-    hit_rate = float((arr > 0).mean())
-
     by_state: dict[str, dict[str, float]] = {}
-    states = sorted({r[0] for r in records})
-    for st in states:
-        sub = np.array([x for (s, x) in records if s == st], dtype=float)
+    for st in sorted({r["state"] for r in records}):
+        sub = np.array([r["excess"] for r in records if r["state"] == st],
+                       dtype=float)
         by_state[st] = {
             "n": int(sub.size),
             "mean_excess_return": float(sub.mean()),
             "hit_rate": float((sub > 0).mean()),
         }
-
+    hold_days = np.array([r["hold_days"] for r in records], dtype=float)
     return {
         "n_signals": n,
-        "mean_excess_return": mean_ex,
-        "hit_rate": hit_rate,
+        "mean_excess_return": float(arr.mean()),
+        "hit_rate": float((arr > 0).mean()),
+        "median_hold_days": float(np.median(hold_days)),
         "by_state": by_state,
+        "horizon": horizon,
+        "source": source,
     }

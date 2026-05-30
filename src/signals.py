@@ -250,13 +250,32 @@ def refine_signals(signals: pd.DataFrame,
     return out
 
 
-def target_weights(signals: pd.DataFrame, cash_buffer: float = 0.05) -> pd.Series:
-    """Equal-weight target across BUY-class signals.
+def target_weights(signals: pd.DataFrame, cash_buffer: float = 0.05,
+                   chase_weight_fraction: float | None = None,
+                   promote_chase: bool = False) -> pd.Series:
+    """Equal-weight target across BUY-class signals, plus an optional
+    partial CHASE sleeve.
 
     If a `state` column is present (from refine_signals), uses the
-    state-aware definition: NEW_BUY + HOLD_IF_LONG (i.e. all positions
-    the model wants exposure to). CHASE is excluded — the model says
-    don't enter from cash.
+    state-aware definition: NEW_BUY + HOLD_IF_LONG (i.e. all confirmed
+    positions the model wants exposure to). CHASE was historically excluded
+    — "model says don't enter from cash" — but the walk-forward sweep
+    showed a 25% partial sleeve adds +5.35pp OOS CAGR (6/6 fold consensus).
+    `chase_weight_fraction` (default = `PARAMS.chase_weight_fraction`)
+    controls that sleeve; 0 reverts to the original full-exclusion behaviour.
+
+    The CHASE sleeve is sized AS A FRACTION OF the per-name confirmed
+    weight, and the freed capital stays in cash — i.e., it does NOT
+    redistribute weight away from NEW_BUY / HOLD_IF_LONG.
+
+    `promote_chase` (default False) folds CHASE-state sectors into the
+    confirmed equal-weight set at FULL per-name weight, bypassing the partial
+    sleeve entirely. This is the regime-aware lever: a static sweep can't tell
+    "leader extended in a bull" from "leader extended into a top", so the
+    extension guard that demotes leaders to CHASE is only safe to relax when
+    the caller has independently confirmed a risk-on regime. The backtest
+    sets this per-rebalance from the SPY trend (see BacktestConfig.regime_aware);
+    leave it False everywhere else to keep today's defensive behaviour.
 
     Otherwise falls back to the raw `signal` column.
 
@@ -265,14 +284,51 @@ def target_weights(signals: pd.DataFrame, cash_buffer: float = 0.05) -> pd.Serie
     separately and should not dilute the equal-weight allocation across
     the 11 SPDR sectors.
     """
-    from config.settings import SUPPLEMENTARY_SECTORS
+    from config.settings import PARAMS, SUPPLEMENTARY_SECTORS
+
+    if chase_weight_fraction is None:
+        chase_weight_fraction = float(PARAMS.chase_weight_fraction)
 
     if "state" in signals.columns:
-        active = signals.index[signals["state"].isin(["NEW_BUY", "HOLD_IF_LONG"])]
+        confirmed = ["NEW_BUY", "HOLD_IF_LONG"]
+        if promote_chase:
+            confirmed = confirmed + ["CHASE"]
+            active = signals.index[signals["state"].isin(confirmed)]
+            chase = pd.Index([])
+        else:
+            active = signals.index[signals["state"].isin(confirmed)]
+            chase = signals.index[signals["state"] == "CHASE"]
     else:
         active = signals.index[signals["signal"] == "BUY"]
+        chase = pd.Index([])
     active = active.difference(SUPPLEMENTARY_SECTORS)
-    if len(active) == 0:
+    chase = chase.difference(SUPPLEMENTARY_SECTORS).difference(active)
+
+    if len(active) == 0 and (chase_weight_fraction <= 0 or len(chase) == 0):
         return pd.Series(dtype=float, name="target_weight")
-    per_name = (1.0 - cash_buffer) / len(active)
-    return pd.Series(per_name, index=active, name="target_weight")
+
+    # Per-name weight for confirmed positions. When there are zero confirmed
+    # but some CHASE, we still anchor the per-name on what the equal-weight
+    # split WOULD have been if we'd treated CHASE as confirmed — so a single
+    # CHASE doesn't accidentally land at (1-buffer) of the book.
+    denom_for_per_name = max(len(active), max(len(chase), 1))
+    per_name = (1.0 - cash_buffer) / denom_for_per_name
+
+    parts: list[pd.Series] = []
+    if len(active):
+        parts.append(pd.Series(per_name, index=active, name="target_weight"))
+
+    # CHASE sleeves COME OUT OF the cash buffer, capped at the buffer size
+    # so total weight never exceeds 1.0 (i.e., no implicit leverage). If
+    # CHASE demand exceeds the buffer, sleeves are scaled down proportionally
+    # so confirmed positions are never starved.
+    if chase_weight_fraction > 0 and len(chase) and cash_buffer > 0:
+        chase_per_name_desired = per_name * float(chase_weight_fraction)
+        chase_total_desired = chase_per_name_desired * len(chase)
+        scale = min(1.0, cash_buffer / chase_total_desired) if chase_total_desired > 0 else 0.0
+        chase_per_name = chase_per_name_desired * scale
+        if chase_per_name > 0:
+            parts.append(pd.Series(chase_per_name, index=chase,
+                                    name="target_weight"))
+
+    return pd.concat(parts) if parts else pd.Series(dtype=float, name="target_weight")

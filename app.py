@@ -313,9 +313,10 @@ render_header(
 )
 
 (tab_dashboard, tab_recap, tab_macro, tab_price, tab_expressions, tab_trend,
- tab_inbox, tab_ingest, tab_history) = st.tabs(
+ tab_inbox, tab_ingest, tab_history, tab_backtest) = st.tabs(
     ["📈 Dashboard", "📰 Weekly Recap", "🌐 Macro", "📉 Price Action",
-     "🎯 Expressions", "✨ Trend", "📧 Inbox", "📥 Ingest Newsletter", "🗂 History"]
+     "🎯 Expressions", "✨ Trend", "📧 Inbox", "📥 Ingest Newsletter",
+     "🗂 History", "🧪 Backtest"]
 )
 
 with tab_dashboard:
@@ -329,6 +330,17 @@ with tab_dashboard:
         signals = refine_signals(raw_signals, history,
                                  macro_alignment=macro_alignment)
         targets = target_weights(signals)
+        # Persist a snapshot of today's refined signals so the Backtest /
+        # forward-perf tracker can read the EXACT state we emitted (vs.
+        # re-replaying the model later, which can drift as PARAMS or
+        # upstream code change). Idempotent on (as_of, ticker).
+        try:
+            from src.db import save_signal_snapshot
+            save_signal_snapshot(date.today(), signals,
+                                 macro_alignment=macro_alignment)
+        except Exception:  # noqa: BLE001
+            # A persistence hiccup must NEVER break the dashboard render.
+            pass
 
     left, right = st.columns([3, 2], gap="large")
 
@@ -386,9 +398,14 @@ with tab_dashboard:
                 })
                 continue
 
-            # BUY action — only fresh NEW_BUY rows. CHASE / HOLD_IF_LONG are
-            # intentionally omitted: extended trends mean no fresh action.
-            if state == "NEW_BUY":
+            # BUY action — fresh NEW_BUY, OR partial CHASE when the live
+            # PARAMS.chase_weight_fraction > 0 (walk-forward sweep picked
+            # 0.25 with 6/6 fold consensus). HOLD_IF_LONG is still omitted —
+            # it means "hold if you already own it, do not add fresh".
+            chase_active = (state == "CHASE" and
+                            PARAMS.chase_weight_fraction > 0 and
+                            tkr in targets.index)
+            if state == "NEW_BUY" or chase_active:
                 vehicle = _cached_top_vehicle(tkr, state, today_iso)
                 if nlv is not None and tkr in targets.index:
                     dollars = float(targets.loc[tkr]) * nlv
@@ -397,8 +414,15 @@ with tab_dashboard:
                     size = "—"
                 conv = _format_conviction(int(row.get("conviction", 0)))
                 why = f"{row['state_reason']}   {conv}"
+                if chase_active:
+                    emoji = "🟠"
+                    label = (f"CHASE {tkr} "
+                             f"({PARAMS.chase_weight_fraction*100:.0f}% partial)")
+                else:
+                    emoji = "🟢"
+                    label = f"BUY {tkr}"
                 orders_rows.append({
-                    "Action":  f"🟢 BUY {tkr}",
+                    "Action":  f"{emoji} {label}",
                     "Vehicle": vehicle,
                     "Size":    size,
                     "Why":     why,
@@ -556,16 +580,40 @@ with tab_dashboard:
         if perf["n_signals"] == 0:
             st.caption("Performance stats unavailable — need ≥4 weeks of history.")
         else:
+            # `signal_performance_vs_benchmark` reads persisted refined
+            # states (source='snapshots'), falling back to the raw replay
+            # (source='history') when no snapshots have been written yet.
+            # Caption honestly mirrors which path was taken and the
+            # actual holding-period horizon used.
+            src = perf.get("source", "history")
+            label = "NEW_BUY" if src == "snapshots" else "BUY/NEW_BUY (raw replay)"
+            horizon = perf.get("horizon", "next_state_exit")
+            hold_str = ""
+            if perf.get("median_hold_days") is not None:
+                hold_str = (f", median hold {perf['median_hold_days']:.0f}d"
+                            if horizon == "next_state_exit"
+                            else "")
+            horizon_label = ("hold-to-state-exit"
+                             if horizon == "next_state_exit"
+                             else "1-week")
             st.caption(
-                f"NEW_BUY signals, last 12 weeks: hit rate "
-                f"{perf['hit_rate']*100:.0f}%, mean excess return "
+                f"{label} signals, last 12 weeks ({horizon_label}{hold_str}): "
+                f"hit rate {perf['hit_rate']*100:.0f}%, mean excess return "
                 f"{perf['mean_excess_return']*100:+.1f}% vs {BENCHMARK} "
                 f"(n={perf['n_signals']})"
             )
 
         _has_buy_signals = not targets.empty
+        _chase_pct = PARAMS.chase_weight_fraction * 100
+        _chase_note = (
+            f"CHASE rows are included at {_chase_pct:.0f}% partial size "
+            f"(walk-forward-selected)."
+            if PARAMS.chase_weight_fraction > 0
+            else "CHASE rows are excluded from targets entirely."
+        )
         with st.expander(
-            "Target weights — actionable allocation (equal-weight NEW_BUY + HOLD_IF_LONG, 5% cash buffer)",
+            f"Target weights — actionable allocation (equal-weight NEW_BUY + "
+            f"HOLD_IF_LONG, partial CHASE sleeve at {_chase_pct:.0f}%)",
             expanded=_has_buy_signals,
         ):
             if targets.empty:
@@ -580,7 +628,7 @@ with tab_dashboard:
                 st.caption(
                     "**Important:** if a row shows `HOLD_IF_LONG` and you don't currently own it, "
                     "do NOT enter — the trend is mature. The target weight is what you'd hold if "
-                    "you already had a position. CHASE rows are excluded from targets entirely."
+                    f"you already had a position. {_chase_note}"
                 )
 
             # Surface any supplementary sector (e.g. UFO/Space) that's in a
@@ -2264,3 +2312,298 @@ with tab_history:
                 _cached_signal_history.clear()
                 st.success(f"Deleted #{target_id}")
                 st.rerun()
+
+
+# ============================================================================
+# Backtest tab — rotation-evidence first.
+#
+# The original framing led with "CAGR vs SPY", which made the strategy look
+# bad in bull regimes (where defensive rotation is SUPPOSED to lose to SPY).
+# That framing made the user second-guess the model at the wrong moments.
+#
+# This rewrite leads with what actually matters for a rotation strategy:
+#   1. CURRENT REGIME — are we in "pay the premium" or "collect the payoff"?
+#   2. DRAWDOWN RECORD — did the strategy preserve capital in past bears?
+#   3. CAPTURE RATIOS — the standard rotation metric.
+# Then the CAGR-vs-SPY framing is demoted to a per-regime breakdown so the
+# bull-regime "underperformance" is contextualised, not headlined.
+# ============================================================================
+with tab_backtest:
+    section("Rotation Backtest — does the model preserve capital in drawdowns?", level=3)
+
+    col_a, col_b, col_c, col_d = st.columns(4)
+    with col_a:
+        bt_cost_bps = st.number_input(
+            "Cost per side (bps)", min_value=0.0, max_value=50.0,
+            value=5.0, step=1.0, key="bt_cost_bps",
+        )
+    with col_b:
+        bt_slip_bps = st.number_input(
+            "Slippage per side (bps)", min_value=0.0, max_value=50.0,
+            value=0.0, step=1.0, key="bt_slip_bps",
+        )
+    with col_c:
+        bt_exec = st.selectbox(
+            "Execution lag", ["next_open", "same_close"], index=0, key="bt_exec",
+        )
+    with col_d:
+        bt_policy = st.selectbox(
+            "Trade policy", ["event_driven", "rebalance_to_target"], index=0,
+            key="bt_policy",
+            help=("event_driven matches the live model: buy on state "
+                  "transition INTO BUY-class, sell on transition OUT. "
+                  "rebalance_to_target drags every held name back to the "
+                  "equal-weight target each week — higher turnover."),
+        )
+
+    @st.cache_data(ttl=6 * 3600, show_spinner=False)
+    def _cached_backtest_full(cost_bps: float, slip_bps: float,
+                                execution: str, trade_policy: str) -> dict:
+        """Run backtest + regime analysis in one cache entry so the UI
+        doesn't re-execute the heavy work for each component."""
+        from src.backtest import BacktestConfig, load_price_panel, run_backtest
+        from src.regime_analysis import (
+            classify_regimes, drawdown_attribution,
+            regime_conditional_stats,
+        )
+        cfg = BacktestConfig(
+            cost_bps=cost_bps, slippage_bps=slip_bps,
+            execution=execution, trade_policy=trade_policy,
+        )
+        res = run_backtest(cfg)
+        closes, _ = load_price_panel()
+        spy_close = closes[BENCHMARK].dropna()
+        aligned = spy_close.reindex(res.equity.index, method="ffill")
+        regimes = classify_regimes(aligned)
+        regime_stats = regime_conditional_stats(
+            res.equity, res.benchmark_equity, regimes)
+        dd_rows = drawdown_attribution(
+            res, res.benchmark_equity, spy_close,
+            min_dd_pct=0.05, min_days=5)
+        current_regime = str(regimes.iloc[-1]) if not regimes.empty else "—"
+        return {
+            "stats": res.stats,
+            "equity": res.equity.to_dict(),
+            "spy_equity": res.benchmark_equity.to_dict(),
+            "n_trades": int(len(res.trades)),
+            "trades_csv": res.trades.to_csv(index=False) if not res.trades.empty else "",
+            "current_regime": current_regime,
+            "regime_stats": regime_stats.reset_index().to_dict("records"),
+            "regime_dist": {r: int(n) for r, n in regimes.value_counts().items()},
+            "drawdowns": dd_rows,
+        }
+
+    with st.spinner("Running backtest + regime analysis…"):
+        out = _cached_backtest_full(bt_cost_bps, bt_slip_bps, bt_exec, bt_policy)
+    stats = out["stats"]
+    current_regime = out["current_regime"]
+    dd_rows = out["drawdowns"]
+    dd_wins = sum(1 for d in dd_rows if d["excess_drawdown"] > 0)
+    dd_total = len(dd_rows)
+    dd_excess_mean = (
+        sum(d["excess_drawdown"] for d in dd_rows) / dd_total
+        if dd_total else 0.0
+    )
+
+    # ---- 1. CURRENT REGIME BADGE (the most important thing) -------------
+    _regime_color = {"BULL": "#2ecc71", "CORRECTION": "#f1c40f",
+                       "BEAR": "#e74c3c"}.get(current_regime, "#888888")
+    _regime_msg = {
+        "BULL":       ("📈 Pay-the-premium mode. Strategy is structurally "
+                       "defensive — give up some SPY upside here is EXPECTED. "
+                       "The insurance is for when the regime turns."),
+        "CORRECTION": ("⚠️ Watch closely. Whipsaw zone — shallow corrections "
+                       "are where the rotation strategy historically loses a "
+                       "small amount. Hold the model; don't override."),
+        "BEAR":       ("🛡️ Collect-the-payoff mode. This is what you've been "
+                       "paying the bull-regime premium for. Down-capture has "
+                       "historically been ~0.65 here. Trust the rotation."),
+    }.get(current_regime, "—")
+    st.markdown(
+        f"<div style='background:{_regime_color}22; border-left:4px solid {_regime_color}; "
+        f"padding:12px 18px; border-radius:4px; margin-bottom:18px;'>"
+        f"<div style='font-size:0.85em; color:#aaa; text-transform:uppercase;'>"
+        f"Current regime</div>"
+        f"<div style='font-size:1.5em; font-weight:bold; color:{_regime_color};'>"
+        f"{current_regime}</div>"
+        f"<div style='margin-top:6px;'>{_regime_msg}</div>"
+        f"</div>", unsafe_allow_html=True,
+    )
+
+    # ---- 2. ROTATION VERDICT (the headline that actually matters) -------
+    if dd_total > 0:
+        verdict_color = "#2ecc71" if dd_wins / dd_total >= 0.6 else "#e74c3c"
+        verdict_text = (
+            f"**Rotation thesis: {dd_wins}/{dd_total} historical SPY drawdowns "
+            f"≥5%, strategy lost less.** Mean excess "
+            f"`{dd_excess_mean*100:+.2f}pp`. "
+        )
+        if dd_wins / dd_total >= 0.6:
+            verdict_text += "**The insurance pays out when the market breaks.**"
+        else:
+            verdict_text += "**The rotation thesis is NOT validated.**"
+    else:
+        verdict_text = "No qualifying drawdowns in window."
+    st.markdown(
+        f"<div style='font-size:1.15em; padding:8px 0;'>{verdict_text}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ---- 3. CAPTURE RATIOS (rotation-strategy gold metrics) ------------
+    regime_lookup = {r["regime"]: r for r in out["regime_stats"]}
+    cap_cols = st.columns(3)
+    for col, regime_label in zip(cap_cols, ["BULL", "CORRECTION", "BEAR"]):
+        r = regime_lookup.get(regime_label)
+        if not r:
+            col.metric(f"{regime_label} capture", "—")
+            continue
+        up = r.get("capture_up")
+        dn = r.get("capture_down")
+        up_str = f"{up:+.2f}" if up is not None and not pd.isna(up) else "—"
+        dn_str = f"{dn:+.2f}" if dn is not None and not pd.isna(dn) else "—"
+        col.metric(
+            f"{regime_label}  (n={int(r['n_days'])}d)",
+            f"↑ {up_str}  ↓ {dn_str}",
+            help=("↑ = strategy/SPY return on up days · "
+                  "↓ = strategy/SPY return on down days. "
+                  "Rotation thesis predicts down-capture < up-capture < 1."),
+        )
+
+    # ---- 4. Equity curve (kept; useful) --------------------------------
+    eq_df = pd.DataFrame({
+        "Strategy": pd.Series(out["equity"]),
+        "SPY":      pd.Series(out["spy_equity"]),
+    })
+    eq_df.index = pd.to_datetime(eq_df.index)
+    eq_df = eq_df.sort_index()
+    st.line_chart(eq_df, height=300)
+
+    # ---- 5. PER-DRAWDOWN BREAKDOWN (the rotation evidence in detail) ---
+    with st.expander(
+        f"Drawdown attribution — every SPY drawdown ≥5% in window ({dd_total})",
+        expanded=False,
+    ):
+        if not dd_rows:
+            st.caption("(no qualifying drawdowns)")
+        else:
+            for i, d in enumerate(dd_rows, 1):
+                won = d["excess_drawdown"] > 0
+                color = "#2ecc71" if won else "#e74c3c"
+                verdict = "LOST LESS ✅" if won else "lost more ❌"
+                rotated = []
+                if d["rotated_in_during_dd"]:
+                    rotated.append(f"in: {', '.join(d['rotated_in_during_dd'])}")
+                if d["rotated_out_during_dd"]:
+                    rotated.append(f"out: {', '.join(d['rotated_out_during_dd'])}")
+                rotated_str = " · ".join(rotated) or "(no rotations)"
+                st.markdown(
+                    f"<div style='border-left:3px solid {color}; padding:6px 12px; "
+                    f"margin-bottom:8px;'>"
+                    f"<b>DD #{i}:</b> {d['peak_date']} → {d['trough_date']} "
+                    f"({d['days_to_trough']}d) — "
+                    f"SPY <code>{d['spy_drawdown']*100:+.2f}%</code>, "
+                    f"strategy <code>{d['strategy_drawdown']*100:+.2f}%</code> "
+                    f"<b>({verdict} by {d['excess_drawdown']*100:+.2f}pp)</b>"
+                    f"<br><span style='color:#888; font-size:0.9em;'>"
+                    f"Rotation: {rotated_str}</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+    # ---- 6. PER-REGIME stats table -------------------------------------
+    with st.expander("Per-regime cumulative returns (context for the SPY gap)",
+                     expanded=False):
+        if not out["regime_stats"]:
+            st.caption("(no regime data)")
+        else:
+            rs_df = pd.DataFrame([
+                {
+                    "regime": r["regime"],
+                    "days": int(r["n_days"]),
+                    "strategy": f"{r['strategy_cum']*100:+.2f}%",
+                    "SPY": f"{r['spy_cum']*100:+.2f}%",
+                    "excess": f"{r['excess_cum']*100:+.2f}%",
+                    "strat MDD": f"{r['strategy_mdd_in_regime']*100:+.2f}%",
+                    "SPY MDD": f"{r['spy_mdd_in_regime']*100:+.2f}%",
+                }
+                for r in out["regime_stats"]
+            ])
+            st.dataframe(rs_df, use_container_width=True, hide_index=True)
+            st.caption(
+                "The BULL-regime 'underperformance' is the premium you pay for "
+                "the BEAR / drawdown protection above. A rotation strategy that "
+                "BEAT SPY in bulls would not be a rotation strategy."
+            )
+
+    # ---- 7. CAGR comparison (DEMOTED — informational only) -------------
+    with st.expander("CAGR comparison vs SPY (full window)", expanded=False):
+        st.caption(
+            f"Headline CAGR comparison over `{stats['window_start']} → "
+            f"{stats['window_end']}` (net of {bt_cost_bps:.0f} bps per-side). "
+            f"**This number is regime-mixed** — interpret only in conjunction "
+            f"with the per-regime breakdown above."
+        )
+        s_strat, s_spy = stats["strategy"], stats["spy"]
+        summary = pd.DataFrame({
+            "Strategy": [
+                f"{s_strat['cagr']*100:+.2f}%", f"{s_strat['ann_vol']*100:.2f}%",
+                f"{s_strat['sharpe']:.2f}", f"{s_strat['max_drawdown']*100:+.2f}%",
+                f"{s_strat['total_return']*100:+.2f}%",
+            ],
+            BENCHMARK: [
+                f"{s_spy['cagr']*100:+.2f}%", f"{s_spy['ann_vol']*100:.2f}%",
+                f"{s_spy['sharpe']:.2f}", f"{s_spy['max_drawdown']*100:+.2f}%",
+                f"{s_spy['total_return']*100:+.2f}%",
+            ],
+        }, index=["CAGR", "Ann. vol", "Sharpe (rf=0)", "Max drawdown",
+                  "Total return"])
+        st.dataframe(summary, use_container_width=True)
+
+    # ---- 8. Cost / turnover row ----------------------------------------
+    with st.expander("Costs & turnover", expanded=False):
+        cols = st.columns(4)
+        cols[0].metric("Trades", f"{stats['n_trades']:,}")
+        cols[1].metric("Ann. turnover", f"{stats['annualised_turnover']:.2f}x")
+        cols[2].metric("Total costs", f"${stats['total_costs']:,.0f}")
+        cols[3].metric("Closed-position hit rate",
+                       f"{stats['closed_position_hit_rate']*100:.1f}%")
+
+    # ---- 9. Sentiment ablation -----------------------------------------
+    with st.expander("Sentiment ablation over the real-data window (small-n)"):
+        from src.backtest import real_sentiment_ablation
+        ab = real_sentiment_ablation()
+        st.caption(ab.get("caveat", ""))
+        rows = []
+        for arm in ("off", "on"):
+            d = ab.get(arm, {})
+            rows.append({
+                "arm": "gate OFF (mechanical core)" if arm == "off"
+                       else "gate ON (real sentiment)",
+                "n_signals": d.get("n_signals", 0),
+                "mean_1w_excess_vs_SPY": (
+                    f"{d.get('mean_excess_1w', 0.0)*100:+.2f}%"
+                    if d.get("n_signals", 0) else "—"
+                ),
+                "hit_rate": (
+                    f"{d.get('hit_rate', 0.0)*100:.0f}%"
+                    if d.get("n_signals", 0) else "—"
+                ),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # ---- 10. Trade log download ----------------------------------------
+    if out["trades_csv"]:
+        st.download_button(
+            "Download trade log (CSV)",
+            data=out["trades_csv"],
+            file_name="backtest_trades.csv",
+            mime="text/csv",
+        )
+
+    st.caption(
+        f"Backtest universe: 11 SPDR sectors (UFO + thematics excluded). "
+        f"Sentiment gate DISABLED (no historical newsletter coverage); macro "
+        f"veto DISABLED (no historical FRED in `prices.db`). Equal-weight "
+        f"NEW_BUY + HOLD_IF_LONG with {PARAMS.chase_weight_fraction*100:.0f}% partial "
+        f"CHASE sleeve, 5% cash buffer. See `BACKTEST_REPORT.md` for the "
+        f"full methodology and caveats."
+    )

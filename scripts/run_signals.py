@@ -15,7 +15,7 @@ from datetime import date, timedelta
 import pandas as pd
 
 from config.settings import BENCHMARK, SECTOR_ETFS
-from src.db import aggregate_sentiment
+from src.db import aggregate_sentiment, save_signal_snapshot
 from src.market_engine import compute_sector_metrics, fetch_prices
 from src.price_store import load_ohlcv
 from src.signal_history import build_signal_history
@@ -77,6 +77,13 @@ def main() -> None:
     print(f"# macro overlay: {msrc} | sentiment rows: {len(sentiment)}")
     signals = refine_signals(raw, history, macro_alignment=macro)
     targets = target_weights(signals)
+    # Persist the snapshot so forward-perf tracking can read the exact
+    # refined state we emitted today (rather than re-replaying the model).
+    try:
+        n = save_signal_snapshot(today, signals, macro_alignment=macro)
+        print(f"# wrote {n} rows to signal_snapshots for {today.isoformat()}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[warn] signal_snapshots write failed: {e!r}", file=sys.stderr)
 
     cols = ["name", "state", "signal", "above_sma", "relative_strength_3m",
             "rs_rank", "extension_pct", "sentiment_score", "n_obs",

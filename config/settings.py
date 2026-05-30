@@ -82,6 +82,21 @@ class SignalParams:
     # in step with the conviction nudge (sector rules are now rich enough that
     # net rarely exceeds ±1 on a normal tape).
     macro_strong_count: int = 1
+    # Partial-CHASE participation. When > 0, CHASE-state sectors enter at this
+    # fraction of the per-name equal-weight target, FUNDED FROM THE CASH
+    # BUFFER (capped so total weight never exceeds 1.0 — no implicit
+    # leverage). Set 0 to fully exclude CHASE — the original behaviour.
+    #
+    # 0.25 was selected by walk-forward sweep (5/6 fold consensus, mean OOS
+    # lift +2.18pp in excess CAGR vs the 0.0 default). See
+    # WALK_FORWARD_REPORT.md. Sole parameter change the sweep's robustness
+    # rule (positive mean OOS lift > 0.5pp) cleared; every other tunable
+    # underperformed default OOS and was kept as-is.
+    #
+    # Note the v1 sweep reported +5.35pp; that number was inflated because
+    # the old sleeve implementation allowed total weight > 1.0 (implicit
+    # leverage). The capped v2 number is the honest one.
+    chase_weight_fraction: float = 0.25
 
 PARAMS = SignalParams()
 

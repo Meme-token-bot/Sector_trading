@@ -160,12 +160,12 @@ def test_perf_short_history_short_circuits():
         index=_weekly_index(1),
     )
     out = signal_performance_vs_benchmark(history, {"SPY": pd.Series(dtype=float)})
-    assert out == {
-        "n_signals": 0,
-        "mean_excess_return": 0.0,
-        "hit_rate": 0.0,
-        "by_state": {},
-    }
+    # Function returns extra diagnostic keys (`horizon`, `source`,
+    # `median_hold_days`) now — assert subset semantics rather than exact ==.
+    assert out["n_signals"] == 0
+    assert out["mean_excess_return"] == 0.0
+    assert out["hit_rate"] == 0.0
+    assert out["by_state"] == {}
 
 
 def test_perf_three_week_history_still_short():
@@ -201,7 +201,11 @@ def test_perf_multi_state_with_fabricated_series():
 
     prices = {"XLK": xlk, "XLF": xlf, "SPY": spy}
 
-    out = signal_performance_vs_benchmark(history, prices, weeks=12)
+    # source='history' forces the in-memory replay path (the function's
+    # default now prefers persisted signal_snapshots, which this test does
+    # not populate).
+    out = signal_performance_vs_benchmark(history, prices, weeks=12,
+                                          source="history")
 
     # XLK was BUY in 3 of 4 weeks; XLF was BUY in 2 of 4 weeks.
     # Some snapshots may not have a forward-1w bar available; require
@@ -218,7 +222,8 @@ def test_perf_multi_state_with_fabricated_series():
     # at least one should be positive and one negative.
     # Re-run with only XLK -> hit rate should be 1.0.
     history_xlk_only = history[["XLK"]]
-    out_xlk = signal_performance_vs_benchmark(history_xlk_only, prices, weeks=12)
+    out_xlk = signal_performance_vs_benchmark(history_xlk_only, prices,
+                                              weeks=12, source="history")
     if out_xlk["n_signals"] > 0:
         assert out_xlk["hit_rate"] == pytest.approx(1.0)
         assert out_xlk["mean_excess_return"] > 0

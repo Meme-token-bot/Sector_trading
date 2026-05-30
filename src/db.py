@@ -70,6 +70,33 @@ CREATE TABLE IF NOT EXISTS weekly_recaps (
 );
 
 CREATE INDEX IF NOT EXISTS idx_wr_as_of ON weekly_recaps(as_of_iso DESC);
+
+-- Persisted refined-state snapshots. One row per (as_of, ticker). Written
+-- by the dashboard + the weekly script (`scripts/run_signals.py`) so we
+-- have a tamper-resistant record of WHAT THE MODEL EMITTED, separate from
+-- what gets re-computed at view time. Forward-perf tracking reads from
+-- here, not from a re-replay of build_signal_history (which could quietly
+-- shift if PARAMS, the sentiment window, or upstream code changes).
+CREATE TABLE IF NOT EXISTS signal_snapshots (
+    as_of                 DATE    NOT NULL,
+    ticker                TEXT    NOT NULL,
+    state                 TEXT    NOT NULL,   -- refined: NEW_BUY / HOLD_IF_LONG / CHASE / REDUCE / HOLD / SELL / WATCH
+    signal                TEXT    NOT NULL,   -- raw: BUY / HOLD / SELL
+    above_sma             INTEGER NOT NULL,   -- 0/1
+    extension_pct         REAL,
+    relative_strength_3m  REAL,
+    rs_rank               INTEGER,
+    sentiment_score       REAL,
+    n_sentiment_obs       INTEGER,
+    macro_tailwinds       INTEGER,
+    macro_headwinds       INTEGER,
+    conviction            INTEGER,
+    consecutive_buy_weeks INTEGER,
+    written_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (as_of, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_snap_ticker ON signal_snapshots(ticker, as_of);
+CREATE INDEX IF NOT EXISTS idx_snap_state  ON signal_snapshots(state, as_of);
 """
 
 
@@ -366,3 +393,126 @@ def delete_weekly_recap(as_of_iso: str, model: str) -> None:
             "DELETE FROM weekly_recaps WHERE as_of_iso = ? AND model = ?",
             (as_of_iso, model),
         )
+
+
+# ---------------------------------------------------------------------------
+# Signal snapshots
+# ---------------------------------------------------------------------------
+
+def save_signal_snapshot(as_of: date, refined: pd.DataFrame,
+                         macro_alignment: pd.DataFrame | None = None) -> int:
+    """Persist one weekly snapshot of the refined-signals frame.
+
+    Idempotent on (as_of, ticker) — re-running the same as_of overwrites.
+    `refined` is the frame returned by `src.signals.refine_signals` (must
+    carry the `state` and `signal` columns at minimum; the rest are stored
+    as NULL when absent so older callers don't break).
+
+    Returns count of rows written.
+    """
+    if refined is None or refined.empty:
+        return 0
+    init_db()
+    rows: list[dict] = []
+    for tkr, row in refined.iterrows():
+        macro_tw = macro_hw = None
+        if macro_alignment is not None and not macro_alignment.empty and tkr in macro_alignment.index:
+            macro_tw = int(macro_alignment.loc[tkr, "tailwinds"] or 0)
+            macro_hw = int(macro_alignment.loc[tkr, "headwinds"] or 0)
+        rows.append({
+            "as_of": as_of.isoformat(),
+            "ticker": str(tkr),
+            "state": str(row.get("state", row.get("signal", ""))),
+            "signal": str(row.get("signal", "")),
+            "above_sma": int(bool(row.get("above_sma", False))),
+            "extension_pct": _safe_float(row.get("extension_pct")),
+            "relative_strength_3m": _safe_float(row.get("relative_strength_3m")),
+            "rs_rank": _safe_int(row.get("rs_rank")),
+            "sentiment_score": _safe_float(row.get("sentiment_score")),
+            "n_sentiment_obs": _safe_int(row.get("n_obs")),
+            "macro_tailwinds": macro_tw,
+            "macro_headwinds": macro_hw,
+            "conviction": _safe_int(row.get("conviction")),
+            "consecutive_buy_weeks": _safe_int(row.get("consecutive_buy_weeks")),
+        })
+    with _conn() as c:
+        c.executemany(
+            """
+            INSERT INTO signal_snapshots
+              (as_of, ticker, state, signal, above_sma, extension_pct,
+               relative_strength_3m, rs_rank, sentiment_score, n_sentiment_obs,
+               macro_tailwinds, macro_headwinds, conviction,
+               consecutive_buy_weeks, written_at)
+            VALUES
+              (:as_of, :ticker, :state, :signal, :above_sma, :extension_pct,
+               :relative_strength_3m, :rs_rank, :sentiment_score, :n_sentiment_obs,
+               :macro_tailwinds, :macro_headwinds, :conviction,
+               :consecutive_buy_weeks, CURRENT_TIMESTAMP)
+            ON CONFLICT(as_of, ticker) DO UPDATE SET
+              state = excluded.state,
+              signal = excluded.signal,
+              above_sma = excluded.above_sma,
+              extension_pct = excluded.extension_pct,
+              relative_strength_3m = excluded.relative_strength_3m,
+              rs_rank = excluded.rs_rank,
+              sentiment_score = excluded.sentiment_score,
+              n_sentiment_obs = excluded.n_sentiment_obs,
+              macro_tailwinds = excluded.macro_tailwinds,
+              macro_headwinds = excluded.macro_headwinds,
+              conviction = excluded.conviction,
+              consecutive_buy_weeks = excluded.consecutive_buy_weeks,
+              written_at = CURRENT_TIMESTAMP
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def load_signal_snapshots(
+    state: str | list[str] | None = None,
+    since: date | None = None,
+    until: date | None = None,
+) -> pd.DataFrame:
+    """Load persisted signal snapshots, optionally filtered by state / window.
+
+    Returns DataFrame with one row per (as_of, ticker). Empty frame if nothing
+    matches. Caller should treat as_of as a date.
+    """
+    init_db()
+    q = "SELECT * FROM signal_snapshots WHERE 1=1"
+    params: list = []
+    if state is not None:
+        states = [state] if isinstance(state, str) else list(state)
+        placeholders = ",".join("?" for _ in states)
+        q += f" AND state IN ({placeholders})"
+        params.extend(states)
+    if since is not None:
+        q += " AND as_of >= ?"
+        params.append(since.isoformat())
+    if until is not None:
+        q += " AND as_of <= ?"
+        params.append(until.isoformat())
+    q += " ORDER BY as_of ASC, ticker ASC"
+    with _conn() as c:
+        df = pd.read_sql_query(q, c, params=params, parse_dates=["as_of"])
+    return df
+
+
+def _safe_float(v) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(f):
+        return None
+    return f
+
+
+def _safe_int(v) -> int | None:
+    try:
+        i = int(v)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(i):
+        return None
+    return i

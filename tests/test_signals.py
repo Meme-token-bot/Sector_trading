@@ -309,3 +309,126 @@ def test_target_weights_excludes_watch_and_vetoed_hold():
     assert out.loc["WATCHER", "state"] == "WATCH"
     tw = target_weights(out)
     assert list(tw.index) == ["BUYER"]
+
+
+# ---------------------------------------------------------------------------
+# Partial-CHASE sleeve in target_weights — selected by walk-forward sweep
+# with 6/6 fold consensus (mean OOS lift +5.35pp). See WALK_FORWARD_REPORT.md.
+# ---------------------------------------------------------------------------
+
+def _state_frame(states: dict[str, str]) -> pd.DataFrame:
+    """Build a refined-signals frame with explicit per-ticker states.
+    Other columns are filled with safe defaults so target_weights is the
+    only thing under test.
+    """
+    rows = []
+    for tkr, st in states.items():
+        rows.append({
+            "ticker": tkr, "state": st, "signal": "BUY" if st in ("NEW_BUY", "HOLD_IF_LONG", "CHASE") else "HOLD",
+            "above_sma": True, "extension_pct": 0.05,
+            "relative_strength_3m": 0.03, "rs_rank": 1,
+            "sentiment_score": 2.0, "n_obs": 1, "conviction": 3,
+        })
+    return pd.DataFrame(rows).set_index("ticker")
+
+
+def test_target_weights_excludes_chase_when_fraction_zero():
+    """chase_weight_fraction=0 reverts to original behaviour (CHASE excluded)."""
+    frame = _state_frame({"XLK": "CHASE", "XLY": "NEW_BUY"})
+    tw = target_weights(frame, cash_buffer=0.05, chase_weight_fraction=0.0)
+    assert "XLK" not in tw.index
+    assert "XLY" in tw.index
+    assert tw["XLY"] == pytest.approx(0.95)  # 1.0 - 0.05 cash, denom=1
+
+
+def test_target_weights_includes_chase_capped_by_cash_buffer():
+    """chase_weight_fraction=0.25 sleeves CHASE at up to 25% of confirmed
+    per-name, capped by the cash buffer so total weight ≤ 1.0. With one
+    CHASE name and a 5% buffer, the desired 0.11875 sleeve scales down
+    to consume exactly the buffer (0.05) — no implicit leverage."""
+    frame = _state_frame({"XLK": "CHASE", "XLY": "NEW_BUY", "XLF": "NEW_BUY"})
+    tw = target_weights(frame, cash_buffer=0.05, chase_weight_fraction=0.25)
+    # Two confirmed (XLY, XLF) split (1 - 0.05) / 2 = 0.475 each. Untouched.
+    assert tw["XLY"] == pytest.approx(0.475)
+    assert tw["XLF"] == pytest.approx(0.475)
+    # CHASE allocation scaled down to fit the cash buffer.
+    assert tw["XLK"] == pytest.approx(0.05)
+    assert tw.sum() == pytest.approx(1.0)
+
+
+def test_target_weights_chase_uncapped_when_buffer_is_generous():
+    """When the buffer easily covers desired CHASE demand, CHASE is sized
+    at exactly chase_weight_fraction × per_name (no scaling kicks in)."""
+    states = {"A": "NEW_BUY", "B": "NEW_BUY", "C": "NEW_BUY",
+              "D": "NEW_BUY", "E": "CHASE"}
+    frame = _state_frame(states)
+    tw = target_weights(frame, cash_buffer=0.20, chase_weight_fraction=0.25)
+    per_name = 0.80 / 4
+    assert tw["A"] == pytest.approx(per_name)
+    assert tw["E"] == pytest.approx(per_name * 0.25)
+    # Buffer not fully consumed — still some cash.
+    assert tw.sum() < 1.0
+
+
+def test_target_weights_chase_does_not_steal_from_confirmed():
+    """Adding a CHASE sleeve must NOT reduce confirmed sizes — it comes out
+    of cash (and is capped at the cash buffer)."""
+    confirmed_only = _state_frame({"XLY": "NEW_BUY", "XLF": "NEW_BUY"})
+    with_chase = _state_frame({"XLK": "CHASE", "XLY": "NEW_BUY",
+                                "XLF": "NEW_BUY"})
+    tw_a = target_weights(confirmed_only, cash_buffer=0.05,
+                           chase_weight_fraction=0.25)
+    tw_b = target_weights(with_chase, cash_buffer=0.05,
+                           chase_weight_fraction=0.25)
+    assert tw_b["XLY"] == pytest.approx(tw_a["XLY"])
+    assert tw_b["XLF"] == pytest.approx(tw_a["XLF"])
+
+
+def test_target_weights_defaults_to_params_chase_fraction():
+    """When chase_weight_fraction=None the live PARAMS default is used."""
+    frame = _state_frame({"XLK": "CHASE", "XLY": "NEW_BUY"})
+    tw = target_weights(frame, cash_buffer=0.05)
+    # Confirmed XLY at 0.95; CHASE XLK desired 0.95 * fraction, capped
+    # at the 0.05 buffer.
+    desired = 0.95 * float(PARAMS.chase_weight_fraction)
+    expected = min(desired, 0.05) if PARAMS.chase_weight_fraction > 0 else 0.0
+    if PARAMS.chase_weight_fraction > 0:
+        assert tw["XLK"] == pytest.approx(expected)
+    else:
+        assert "XLK" not in tw.index
+
+
+# ---------------------------------------------------------------------------
+# Regime-aware promote_chase — CHASE folded into confirmed set at full weight.
+# Used by the backtest's bull overlay (BacktestConfig.regime_aware).
+# ---------------------------------------------------------------------------
+
+def test_promote_chase_folds_chase_into_equal_weight():
+    """promote_chase=True treats CHASE like NEW_BUY: full per-name weight,
+    no partial sleeve. With buffer 0 the book is fully invested."""
+    frame = _state_frame({"XLK": "CHASE", "XLY": "NEW_BUY", "XLF": "NEW_BUY"})
+    tw = target_weights(frame, cash_buffer=0.0, promote_chase=True)
+    # Three confirmed names split the whole book equally.
+    assert tw["XLK"] == pytest.approx(1.0 / 3)
+    assert tw["XLY"] == pytest.approx(1.0 / 3)
+    assert tw["XLF"] == pytest.approx(1.0 / 3)
+    assert tw.sum() == pytest.approx(1.0)
+
+
+def test_promote_chase_gives_chase_more_than_partial_sleeve():
+    """The whole point: in a bull, a promoted CHASE leader gets a real
+    equal-weight slice, not the buffer-capped sleeve it gets when gated."""
+    frame = _state_frame({"XLK": "CHASE", "XLY": "NEW_BUY"})
+    gated = target_weights(frame, cash_buffer=0.05, chase_weight_fraction=0.25)
+    promoted = target_weights(frame, cash_buffer=0.0, promote_chase=True)
+    assert promoted["XLK"] > gated["XLK"]
+    assert promoted["XLK"] == pytest.approx(0.5)  # split 1.0 with XLY
+
+
+def test_promote_chase_false_is_unchanged():
+    """promote_chase defaults False → identical to today's gated behaviour."""
+    frame = _state_frame({"XLK": "CHASE", "XLY": "NEW_BUY"})
+    default = target_weights(frame, cash_buffer=0.05, chase_weight_fraction=0.25)
+    explicit = target_weights(frame, cash_buffer=0.05, chase_weight_fraction=0.25,
+                              promote_chase=False)
+    assert default.equals(explicit)
