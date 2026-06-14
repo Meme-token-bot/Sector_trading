@@ -144,66 +144,109 @@ def _build_service():
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
-def fetch_unread(mark_seen: bool = False) -> list[FetchedMessage]:
-    """Fetch all unread messages matching the filter. Returns parsed messages.
+def _list_message_ids(svc, query: str) -> list[str]:
+    """Walk all pages of a Gmail messages.list, returning message ids."""
+    ids: list[str] = []
+    page_token = None
+    while True:
+        resp = svc.users().messages().list(
+            userId="me", q=query, pageToken=page_token,
+        ).execute()
+        ids.extend(m["id"] for m in resp.get("messages", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return ids
+
+
+def _get_full_message(svc, msg_id: str, mark_seen: bool) -> FetchedMessage:
+    """Pull one message in raw form and parse to FetchedMessage."""
+    full = svc.users().messages().get(
+        userId="me", id=msg_id, format="raw",
+    ).execute()
+    raw = base64.urlsafe_b64decode(full["raw"])
+    msg = email.message_from_bytes(raw)
+
+    message_id = (msg.get("Message-ID") or f"<no-id-{msg_id}@local>").strip()
+    from_disp, from_email = _parse_from_addr(msg.get("From"))
+    subject = _decode_header_value(msg.get("Subject"))
+    sent = _parse_date(msg.get("Date"))
+    body_html, body_text, attachments = _walk_for_bodies(msg)
+
+    if mark_seen:
+        svc.users().messages().modify(
+            userId="me", id=msg_id,
+            body={"removeLabelIds": ["UNREAD"]},
+        ).execute()
+
+    return FetchedMessage(
+        gmail_uid=msg_id, message_id=message_id,
+        from_addr=from_disp, from_email=from_email,
+        subject=subject, sent_date=sent,
+        body_html=body_html, body_text=body_text,
+        pdf_attachments=attachments,
+    )
+
+
+def count_messages(query: str | None = None) -> int:
+    """Count messages matching `query` (defaults to the unread filter).
+
+    Cheap — only walks the paginated id list, never downloads message bodies.
+    Useful for sizing a backfill before paying for OpenAI calls.
+    """
+    if not gmail_configured():
+        raise RuntimeError("Gmail not configured.")
+    svc = _build_service()
+    q = query if query is not None else _build_search_query()
+    return len(_list_message_ids(svc, q))
+
+
+def fetch_messages(query: str | None = None,
+                   mark_seen: bool = False,
+                   limit: int | None = None) -> list[FetchedMessage]:
+    """Fetch messages matching `query` (defaults to the unread filter).
 
     `mark_seen=True` removes the UNREAD label so re-runs don't re-pull the
-    same mail. Defaults to False so you can iterate safely while testing.
+    same mail. The default False is safe for backfills: we don't want a
+    backfill of already-read mail to flip its read status either way.
+    `limit` caps how many messages are downloaded — useful for incremental
+    backfill batches.
     """
     if not gmail_configured():
         raise RuntimeError(
             "Gmail not configured. Set GMAIL_ADDRESS in .env and generate a "
             "token via: PYTHONPATH=. python scripts/gmail_oauth_setup.py"
         )
-
     svc = _build_service()
-    out: list[FetchedMessage] = []
-    query = _build_search_query()
+    q = query if query is not None else _build_search_query()
+    msg_ids = _list_message_ids(svc, q)
+    if limit is not None:
+        msg_ids = msg_ids[:limit]
+    return [_get_full_message(svc, mid, mark_seen=mark_seen) for mid in msg_ids]
 
-    # users.messages.list is paginated; walk every page of matching ids.
-    msg_ids: list[str] = []
-    page_token = None
-    while True:
-        resp = svc.users().messages().list(
-            userId="me", q=query, pageToken=page_token,
-        ).execute()
-        msg_ids.extend(m["id"] for m in resp.get("messages", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
 
-    for msg_id in msg_ids:
-        full = svc.users().messages().get(
-            userId="me", id=msg_id, format="raw",
-        ).execute()
-        raw = base64.urlsafe_b64decode(full["raw"])
-        msg = email.message_from_bytes(raw)
+def fetch_unread(mark_seen: bool = False) -> list[FetchedMessage]:
+    """Backward-compatible wrapper: fetch all unread messages matching the
+    configured filter. Identical to the original API; new callers should
+    prefer `fetch_messages(query=...)` for explicit queries.
+    """
+    return fetch_messages(query=_build_search_query(), mark_seen=mark_seen)
 
-        message_id = (msg.get("Message-ID") or f"<no-id-{msg_id}@local>").strip()
-        from_disp, from_email = _parse_from_addr(msg.get("From"))
-        subject = _decode_header_value(msg.get("Subject"))
-        sent = _parse_date(msg.get("Date"))
-        body_html, body_text, attachments = _walk_for_bodies(msg)
 
-        out.append(FetchedMessage(
-            gmail_uid=msg_id,
-            message_id=message_id,
-            from_addr=from_disp,
-            from_email=from_email,
-            subject=subject,
-            sent_date=sent,
-            body_html=body_html,
-            body_text=body_text,
-            pdf_attachments=attachments,
-        ))
+def build_backfill_query(after: date,
+                          before: date | None = None,
+                          require_filter_address: bool = True) -> str:
+    """Construct a Gmail search query for historical backfill.
 
-        if mark_seen:
-            svc.users().messages().modify(
-                userId="me", id=msg_id,
-                body={"removeLabelIds": ["UNREAD"]},
-            ).execute()
-
-    return out
+    `after` is INCLUSIVE; `before` is EXCLUSIVE (Gmail's convention). Date
+    operators take YYYY/MM/DD. Drops the `is:unread` constraint so we can
+    pull already-read mail; keeps the `to:` filter when configured."""
+    parts: list[str] = [f"after:{after.strftime('%Y/%m/%d')}"]
+    if before is not None:
+        parts.append(f"before:{before.strftime('%Y/%m/%d')}")
+    if require_filter_address and GMAIL_FILTER_ADDRESS:
+        parts.append(f"to:{GMAIL_FILTER_ADDRESS}")
+    return " ".join(parts)
 
 
 def test_connection() -> tuple[bool, str]:

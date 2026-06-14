@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import Callable
 
 from openai import OpenAI
 
@@ -108,15 +109,27 @@ def ingest(raw_text: str,
 
 
 def fetch_and_ingest(mark_seen: bool = True,
-                     follow_links: bool = True) -> list[dict]:
-    """End-to-end: pull unread Gmail, enrich with whitelisted links/PDFs,
+                     follow_links: bool = True,
+                     query: str | None = None,
+                     limit: int | None = None,
+                     on_message: Callable[[dict], None] | None = None,
+                     ) -> list[dict]:
+    """End-to-end: pull matching Gmail, enrich with whitelisted links/PDFs,
     parse with the LLM, persist. Returns a per-message report.
+
+    `query` overrides the default `is:unread to:<filter>` — used by the
+    backfill script to pull historical messages by date range. `limit` caps
+    how many messages get downloaded (useful for batched backfills). When
+    `query` is passed, you almost certainly want `mark_seen=False` — flipping
+    the UNREAD state on backfilled mail would mess with the user's inbox.
+    `on_message` (if provided) is called with each completed report entry
+    so long-running backfills can stream progress.
     """
     from src.content_extractor import build_context
     from src.db import attach_gmail_message_id, gmail_message_already_ingested
-    from src.gmail_client import fetch_unread
+    from src.gmail_client import fetch_messages
 
-    messages = fetch_unread(mark_seen=mark_seen)
+    messages = fetch_messages(query=query, mark_seen=mark_seen, limit=limit)
     report: list[dict] = []
     for m in messages:
         entry: dict = {
@@ -129,6 +142,8 @@ def fetch_and_ingest(mark_seen: bool = True,
         if gmail_message_already_ingested(m.message_id):
             entry["status"] = "skipped_dupe_message_id"
             report.append(entry)
+            if on_message:
+                on_message(entry)
             continue
 
         try:
@@ -161,4 +176,6 @@ def fetch_and_ingest(mark_seen: bool = True,
             entry["status"] = "error"
             entry["error"] = str(e)
         report.append(entry)
+        if on_message:
+            on_message(entry)
     return report
