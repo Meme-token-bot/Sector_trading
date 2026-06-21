@@ -53,6 +53,12 @@ FRED_SERIES = {
     "REAL_10Y":       "DFII10",         # 10Y TIPS real yield, %, daily
     "BREAKEVEN_5Y5Y": "T5YIFR",         # 5y5y forward inflation expectation, %, daily
     "T10Y2Y":         "T10Y2Y",         # 10Y - 2Y spread, %, daily
+    "BREAKEVEN_10Y":  "T10YIE",         # 10Y breakeven inflation rate, %, daily
+    "INIT_CLAIMS":    "IC4WSA",         # 4-week avg initial claims, thousands, weekly
+    "MORTGAGE_30Y":   "MORTGAGE30US",   # 30Y fixed mortgage rate, %, weekly
+    "FIN_CONDITIONS": "NFCI",           # Chicago Fed NFCI (z-score, loose<0), weekly
+    "UST2":           "DGS2",           # 2Y constant-maturity nominal, %, daily
+    "IG_OAS":         "BAMLC0A4CBBB",   # ICE BofA BBB OAS (investment grade), %, daily
 }
 
 # --- signal parameters --------------------------------------------------

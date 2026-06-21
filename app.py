@@ -148,11 +148,18 @@ def _cached_macro_bundle() -> dict:
         "HY_OAS":         fred.get("HY_OAS", {}),
         "UST10":          fred.get("UST10", {}),
         "REAL_10Y":       fred.get("REAL_10Y", {}),
-        "BREAKEVEN_5Y5Y": fred.get("BREAKEVEN_5Y5Y", {}),
-        "DXY":            dxy_level(macro_prices),
-        "VIX":            vix_level(macro_prices),
-        "GOLD_OIL":       gold_oil_ratio(macro_prices),
-        "COPPER_GOLD":    copper_gold_ratio(macro_prices),
+        "BREAKEVEN_5Y5Y":  fred.get("BREAKEVEN_5Y5Y", {}),
+        "BREAKEVEN_10Y":   fred.get("BREAKEVEN_10Y", {}),
+        "INIT_CLAIMS":     fred.get("INIT_CLAIMS", {}),
+        "MORTGAGE_30Y":    fred.get("MORTGAGE_30Y", {}),
+        "MORTGAGE_SPREAD": fred.get("MORTGAGE_SPREAD", {}),
+        "FIN_CONDITIONS":  fred.get("FIN_CONDITIONS", {}),
+        "UST2":            fred.get("UST2", {}),
+        "IG_OAS":          fred.get("IG_OAS", {}),
+        "DXY":             dxy_level(macro_prices),
+        "VIX":             vix_level(macro_prices),
+        "GOLD_OIL":        gold_oil_ratio(macro_prices),
+        "COPPER_GOLD":     copper_gold_ratio(macro_prices),
     }
 
 
@@ -1156,7 +1163,45 @@ _BREAKEVEN_BANDS = [
     ("Anchored",           "🟢", "1.8–2.5%", lambda v: 1.8 <= v < 2.5),
     ("Unanchored",         "🟠", "≥ 2.5%",   lambda v: v >= 2.5),
 ]
-
+_IG_OAS_BANDS = [
+("Tight (risk-on)", "🟢", "< 1.5%",   lambda v: v < 1.5),
+("Normal",          "🟡", "1.5–2.0%", lambda v: 1.5 <= v < 2.0),
+("Widening",        "🟠", "2.0–2.5%", lambda v: 2.0 <= v < 2.5),
+("Stressed",        "🔴", "≥ 2.5%",   lambda v: v >= 2.5),
+]
+_NFCI_BANDS = [
+("Very loose (risk-on)", "🟢", "< -0.5",  lambda v: v < -0.5),
+("Loose",                "🟢", "-0.5–0",  lambda v: -0.5 <= v < 0),
+("Tightening",           "🟡", "0–0.5",   lambda v: 0 <= v < 0.5),
+("Tight",                "🟠", "0.5–1",   lambda v: 0.5 <= v < 1.0),
+("Very tight (stress)",  "🔴", "≥ 1",     lambda v: v >= 1.0),
+]
+_CLAIMS_Z_BANDS = [
+("Very tight labor",  "🟢", "z < -1",  lambda v: v < -1),
+("Tight labor",       "🟢", "-1 to 0", lambda v: -1 <= v < 0),
+("Normalising",       "🟡", "0 to 1",  lambda v: 0 <= v < 1),
+("Weakening",         "🟠", "1 to 2",  lambda v: 1 <= v < 2),
+("Deteriorating",     "🔴", "z ≥ 2",   lambda v: v >= 2),
+]
+_BREAKEVEN_10Y_BANDS = [
+("Deflationary fears", "🔴", "< 1.8%",   lambda v: v < 1.8),
+("Below target",       "🟡", "1.8–2.0%", lambda v: 1.8 <= v < 2.0),
+("On target",          "🟢", "2.0–2.5%", lambda v: 2.0 <= v < 2.5),
+("Above target",       "🟠", "2.5–3.0%", lambda v: 2.5 <= v < 3.0),
+("Unanchored",         "🔴", "≥ 3.0%",   lambda v: v >= 3.0),
+]
+_UST2_BANDS = [
+("Low / Fed easy",     "🟢", "< 3%", lambda v: v < 3),
+("Normal",             "🟡", "3–4%", lambda v: 3 <= v < 4),
+("Elevated",           "🟠", "4–5%", lambda v: 4 <= v < 5),
+("High / restrictive", "🔴", "≥ 5%", lambda v: v >= 5),
+]
+_MORTGAGE_BANDS = [
+("Low",        "🟢", "< 4%", lambda v: v < 4),
+("Normal",     "🟡", "4–6%", lambda v: 4 <= v < 6),
+("Elevated",   "🟠", "6–7%", lambda v: 6 <= v < 7),
+("Restrictive","🔴", "≥ 7%", lambda v: v >= 7),
+]
 
 def _find_band(value, bands):
     if value is None or value != value:  # NaN check without numpy dependency
@@ -1330,20 +1375,53 @@ with tab_macro:
         )
 
     # Third Risk/Vol indicator sits alone in a half-width cell (odd count)
-    _rv_col3, _ = st.columns(2)
+    _rv_col3, _rv_col4 = st.columns(2)
     with _rv_col3:
         _render_macro_indicator(
             label="Gold / Oil",
             payload=gor,
             title="Gold / Oil Ratio",
             description=("GC=F front-month / CL=F front-month. Rises when gold "
-                         "(safe-haven, real-asset hedge) outperforms oil "
-                         "(growth-sensitive demand)."),
+                        "(safe-haven, real-asset hedge) outperforms oil "
+                        "(growth-sensitive demand)."),
             fmt="{:.1f}",
             bands=_GOLD_OIL_BANDS,
             signal=("Ratio > 30 → recession/risk-off bid; favor XLP, XLU, XLV. "
                     "Ratio < 15 → strong oil cycle; XLE tailwind. "
                     "Big z-spikes have led peaks historically."),
+            compact=True,
+        )
+    with _rv_col4:
+        _render_macro_indicator(
+            label="BBB / IG OAS",
+            payload=fred.get("IG_OAS", {}),
+            title="BBB Corporate Spread (IG OAS)",
+            description=("ICE BofA BBB option-adjusted spread — the lowest rung of "
+                        "investment grade. Widens before HY OAS, making it the "
+                        "earliest credit-market warning available."),
+            fmt="{:.2f}%",
+            bands=_IG_OAS_BANDS,
+            signal=("< 1.5% → IG healthy; XLF, XLK, XLY, XLRE supported. "
+                    "> 2.0% → IG stress; early warning before HY OAS widens — "
+                    "reduce cyclicals, start trimming XLF."),
+            compact=True,
+        )
+
+    _rv_col5, _ = st.columns(2)
+    with _rv_col5:
+        _render_macro_indicator(
+            label="Financial conditions",
+            payload=fred.get("FIN_CONDITIONS", {}),
+            title="Chicago Fed Financial Conditions (NFCI)",
+            description=("Aggregates ~105 money-market, credit, and equity measures "
+                        "into one z-score. Negative = looser than average (risk-on); "
+                        "positive = tighter (risk-off)."),
+            fmt="{:+.3f}",
+            bands=_NFCI_BANDS,
+            signal=("< -0.5 → loose; supports XLK, XLY, XLRE, UFO. "
+                    "> 0.5 → tight; rotate defensives (XLP, XLV, XLU); "
+                    "XLRE and growth face headwind."),
+            delta_kind="slope",
             compact=True,
         )
 
@@ -1387,6 +1465,26 @@ with tab_macro:
             signal=("DXY > 105 → headwind for commodities (XLB, XLE) and "
                     "multinational earnings (XLK, XLI). DXY < 95 → commodity "
                     "tailwind, EM-sensitive sectors benefit."),
+            compact=True,
+        )
+    
+    _gc_claims1, _ = st.columns(2)
+    with _gc_claims1:
+        _render_macro_indicator(
+            label="Initial claims (4-wk avg)",
+            payload=fred.get("INIT_CLAIMS", {}),
+            title="Initial Jobless Claims (4-week average)",
+            description=("IC4WSA: 4-week moving average of initial unemployment "
+                        "insurance claims, thousands. The highest-frequency leading "
+                        "labour indicator — turns weeks before payrolls and is "
+                        "published every Thursday."),
+            fmt="{:,.0f}k",
+            bands=_CLAIMS_Z_BANDS,
+            band_input="z",
+            delta_kind="z",
+            signal=("z < -1 → tight labour; cyclicals supported (XLY, XLI, XLB, XLF). "
+                    "z > +1 → labour deteriorating; rotate defensives (XLP, XLV, XLU). "
+                    "z > +2 → recession signal; exit cyclicals."),
             compact=True,
         )
 
@@ -1467,6 +1565,63 @@ with tab_macro:
                     "reflation; tailwind for XLE, XLB, but watch for hawkish Fed."),
             compact=True,
         )
+    _ri_col5, _ri_col6 = st.columns(2)
+with _ri_col5:
+    _render_macro_indicator(
+        label="2Y nominal",
+        payload=fred.get("UST2", {}),
+        title="2Y Nominal Yield",
+        description=("Constant-maturity 2-year Treasury yield. Primarily driven by "
+                     "Fed expectations — the most sensitive instrument to the "
+                     "interest-rate path. A falling 2Y signals rate cuts ahead."),
+        fmt="{:.2f}%",
+        bands=_UST2_BANDS,
+        signal=("< 3.5% with falling slope → cuts priced; XLRE, XLU, XLK benefit. "
+                "> 4.5% → prolonged tightening expected; XLU, XLRE under pressure. "
+                "Falling faster than 10Y → curve steepening; XLF NIM expands."),
+        delta_kind="slope",
+        compact=True,
+    )
+with _ri_col6:
+    _render_macro_indicator(
+        label="10Y breakeven",
+        payload=fred.get("BREAKEVEN_10Y", {}),
+        title="10Y Breakeven Inflation Rate",
+        description=("T10YIE: 10Y nominal Treasury minus 10Y TIPS. The spot "
+                     "market-implied inflation expectation for the next decade. "
+                     "More actionable for near-term rotation than the 5Y5Y forward."),
+        fmt="{:.2f}%",
+        bands=_BREAKEVEN_10Y_BANDS,
+        signal=("< 2.0% → below-target inflation; XLK, XLRE favoured. "
+                "2.0–2.5% → anchored; neutral. "
+                "> 2.5% → above target; XLE, XLB tailwind; "
+                "XLK headwind from rising real discount rate."),
+        compact=True,
+    )
+
+_ri_col7, _ = st.columns(2)
+with _ri_col7:
+    _mspread = fred.get("MORTGAGE_SPREAD", {}).get("current")
+    _mspread_str = (
+        f" · spread vs 10Y: {_mspread:+.2f}%"
+        if _mspread and pd.notna(_mspread) else ""
+    )
+    _render_macro_indicator(
+        label="30Y mortgage",
+        payload=fred.get("MORTGAGE_30Y", {}),
+        title=f"30Y Fixed Mortgage Rate{_mspread_str}",
+        description=("MORTGAGE30US: Freddie Mac 30-year fixed rate. The mortgage "
+                     "spread (mortgage minus 10Y Treasury) measures housing credit "
+                     "availability beyond the general rate level — wide spread "
+                     "= housing credit tight even after rate cuts."),
+        fmt="{:.2f}%",
+        bands=_MORTGAGE_BANDS,
+        signal=("< 6.5% → affordable; XLY homebuilders (XHB/ITB) and XLRE bid. "
+                "> 7.5% → housing locked; XLY and XLRE headwind. "
+                "Spread > 2.5% → housing credit tight beyond rate level."),
+        delta_kind="slope",
+        compact=True,
+    )
 
     with st.expander("📖 How to use this tab — bands & caveats"):
         st.markdown(

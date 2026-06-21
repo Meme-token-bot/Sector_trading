@@ -128,123 +128,140 @@ def vix_level(macro_prices: pd.DataFrame) -> dict:
             "series": s}
 
 
+def _get_fred_api_key() -> str:
+    """Load FRED API key from environment or .env file.
+
+    Checks os.environ first (covers both shell exports and dotenv pre-loading),
+    then falls back to reading the project-root .env file directly. Raises
+    clearly if the key is missing so the error surfaces in the UI rather than
+    as a cryptic HTTP 400.
+    """
+    import os
+    from pathlib import Path
+
+    key = os.environ.get("FRED_API_KEY", "").strip()
+    if key:
+        return key
+
+    # Walk up from this file's directory to find the project .env
+    for candidate in [
+        Path(".env"),
+        Path(__file__).parent.parent / ".env",
+    ]:
+        if candidate.exists():
+            for line in candidate.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("FRED_API_KEY="):
+                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if key:
+                        return key
+
+    raise RuntimeError(
+        "FRED_API_KEY not found. Add FRED_API_KEY=yourkey to .env "
+        "or set it as an environment variable."
+    )
+
+
 def _fetch_fred_series(series_id: str, lookback_days: int = 400) -> pd.Series:
-    """Pull a FRED series via the public CSV endpoint.
+    """Pull a FRED series via the authenticated JSON API.
+
+    Uses api.stlouisfed.org (authenticated, reliable) as the primary endpoint
+    and falls back to the anonymous fredgraph.csv endpoint for resilience.
 
     Returns a date-indexed float Series (NaNs dropped) trimmed to the trailing
-    `lookback_days` calendar days. Raises on HTTP / parse failure — callers
-    decide whether to surface or swallow.
+    `lookback_days` calendar days. Raises if both endpoints fail.
     """
     import io
     import requests
+
+    cutoff = (date.today() - timedelta(days=lookback_days)).isoformat()
+
+    # --- Primary: FRED JSON API (authenticated, different infrastructure) ---
+    try:
+        api_key = _get_fred_api_key()
+        url = (
+            "https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id={series_id}"
+            f"&observation_start={cutoff}"
+            f"&api_key={api_key}"
+            "&file_type=json"
+            "&sort_order=asc"
+        )
+        resp = requests.get(
+            url, headers={"User-Agent": "sector-rotation/1.0"}, timeout=15
+        )
+        resp.raise_for_status()
+        obs = resp.json().get("observations", [])
+        if obs:
+            df = pd.DataFrame(obs)[["date", "value"]]
+            df["date"] = pd.to_datetime(df["date"])
+            # FRED uses "." for missing observations
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            s = df.dropna(subset=["value"]).set_index("date")["value"]
+            s.name = series_id
+            if not s.empty:
+                return s
+    except Exception:
+        pass
+
+    # --- Fallback: anonymous CSV endpoint ---
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    resp = requests.get(url, headers={"User-Agent": "sector-rotation/1.0"}, timeout=30)
+    resp = requests.get(
+        url, headers={"User-Agent": "sector-rotation/1.0"}, timeout=30
+    )
     resp.raise_for_status()
     df = pd.read_csv(io.StringIO(resp.text), parse_dates=["observation_date"])
     df = df.rename(columns={"observation_date": "date", series_id: "value"})
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
     s = df.dropna().set_index("date")["value"]
-    cutoff = pd.Timestamp(date.today() - timedelta(days=lookback_days))
-    s = s[s.index >= cutoff]
+    cutoff_ts = pd.Timestamp(date.today() - timedelta(days=lookback_days))
+    s = s[s.index >= cutoff_ts]
     s.name = series_id
     return s
 
 
-def _yf_close(tickers: list[str] | str, lookback_days: int) -> pd.DataFrame:
-    """Download Close prices from yfinance, always returning a plain DataFrame
-    with ticker names as columns (no MultiIndex), NaN rows dropped, tz-naive index.
-    """
-    cutoff = date.today() - timedelta(days=lookback_days)
-    raw = yf.download(
-        tickers, start=cutoff, end=date.today() + timedelta(days=1),
-        auto_adjust=True, progress=False,
-    )
-    if raw is None or raw.empty:
-        cols = [tickers] if isinstance(tickers, str) else list(tickers)
-        return pd.DataFrame(columns=cols)
-    if isinstance(raw.columns, pd.MultiIndex):
-        df = raw["Close"].copy()
-    else:
-        tkr = tickers if isinstance(tickers, str) else tickers[0]
-        df = raw[["Close"]].rename(columns={"Close": tkr})
-    df.index = pd.to_datetime(df.index).tz_localize(None).normalize()
-    return df.dropna(how="all")
-
-
-def _fetch_tnx_series(lookback_days: int = 400) -> pd.Series:
-    """Pull 10Y nominal Treasury yield via yfinance (^TNX).
-
-    yfinance stores ^TNX directly in percentage points (e.g. 4.35 = 4.35%).
-    No scaling is applied.
-    """
-    df = _yf_close("^TNX", lookback_days)
-    if df.empty or "^TNX" not in df.columns:
-        return pd.Series(dtype=float, name="^TNX")
-    return df["^TNX"].dropna().rename("^TNX")
-
-
-def _fetch_yield_curve_yf(lookback_days: int = 400) -> pd.Series:
-    """10Y–3M Treasury spread from yfinance (^TNX minus ^IRX).
-
-    ^TNX = 10Y yield in %.  ^IRX = 13-week T-bill yield in %.
-    The 10Y–3M spread is not identical to FRED's T10Y2Y (10Y–2Y) but carries
-    the same recession-signal interpretation and is the best proxy available
-    via yfinance.
-    """
-    df = _yf_close(["^TNX", "^IRX"], lookback_days)
-    if df.empty or "^TNX" not in df.columns or "^IRX" not in df.columns:
-        return pd.Series(dtype=float, name="T10Y3M_yf")
-    spread = (df["^TNX"] - df["^IRX"]).dropna()
-    spread.name = "T10Y3M_yf"
-    return spread
-
-
 def yield_curve_spread() -> dict:
-    """10Y–2Y Treasury spread, preferring FRED T10Y2Y with yfinance (10Y–3M) fallback.
+    """10Y–2Y Treasury spread from FRED T10Y2Y (via authenticated API).
 
-    FRED's T10Y2Y series is the canonical source. If it times out (which happens
-    intermittently on DGS* / T10Y* series from some networks), we fall back to
-    computing the spread from yfinance ^TNX and ^IRX. The 10Y–3M spread is not
-    identical to 10Y–2Y but carries the same recession-signal interpretation.
-    The source used is recorded in the returned dict as 'source'.
+    Returns current reading, 30-day slope, and the trailing 120-day series
+    for the chart. On failure returns NaNs with an 'error' key.
     """
-    def _compute(s: pd.Series) -> dict:
-        slope = (s.iloc[-1] - s.iloc[-30]) / 30 if len(s) >= 30 else np.nan
-        return {"current": float(s.iloc[-1]), "slope_30d": float(slope), "series": s}
-
-    # Primary: FRED T10Y2Y
     try:
         s = _fetch_fred_series(FRED_SERIES["T10Y2Y"], lookback_days=120)
-        if not s.empty:
-            return {**_compute(s), "source": "FRED T10Y2Y"}
-    except Exception:
-        pass
-
-    # Fallback: yfinance 10Y–3M
-    try:
-        s = _fetch_yield_curve_yf(lookback_days=120)
-        if not s.empty:
-            return {**_compute(s), "source": "yfinance 10Y–3M"}
+        if s.empty:
+            return {"current": np.nan, "slope_30d": np.nan, "error": "empty series"}
+        slope = float((s.iloc[-1] - s.iloc[-30]) / 30) if len(s) >= 30 else np.nan
+        return {"current": float(s.iloc[-1]), "slope_30d": slope, "series": s}
     except Exception as e:
-        pass
-
-    return {"current": np.nan, "slope_30d": np.nan, "error": "all sources failed"}
+        return {"current": np.nan, "slope_30d": np.nan, "error": str(e)}
 
 
 def fetch_fred_indicators() -> dict[str, dict]:
-    """Pull the panel's non-curve FRED series. One bad series surfaces as
-    {"current": nan, "error": ...} but does not abort the others.
+    """Pull all FRED macro series via the authenticated JSON API.
 
-    UST10 is sourced from yfinance ^TNX (FRED DGS10 times out on this network).
-    HY_OAS, REAL_10Y, and BREAKEVEN_5Y5Y use FRED sequentially — parallel FRED
-    connections triggered rate-limiting that broke DFII10 (REAL_10Y).
-    BREAKEVEN_5Y5Y has no yfinance equivalent; it shows blank if FRED times out.
+    Fetches 10 series in parallel (API key lifts the anonymous rate limit).
+    One bad series surfaces as {"current": nan, "error": ...} without aborting
+    the others. A derived MORTGAGE_SPREAD key is appended after the fetch.
+
+    Keys returned: HY_OAS, UST10, REAL_10Y, BREAKEVEN_5Y5Y, BREAKEVEN_10Y,
+    INIT_CLAIMS, MORTGAGE_30Y, FIN_CONDITIONS, UST2, IG_OAS, MORTGAGE_SPREAD.
     """
+    import concurrent.futures
+
     spec = {
+        # Existing
         "HY_OAS":         ("z_score_1y",),
         "UST10":          ("slope_30d",),
         "REAL_10Y":       ("slope_30d",),
         "BREAKEVEN_5Y5Y": ("z_score_1y",),
+        # New Tier 1
+        "BREAKEVEN_10Y":  ("z_score_1y",),
+        "INIT_CLAIMS":    ("z_score_1y", "slope_30d"),
+        "MORTGAGE_30Y":   ("slope_30d",),
+        "FIN_CONDITIONS": ("slope_30d",),   # NFCI is already a z-score; slope = direction
+        # New Tier 2
+        "UST2":           ("slope_30d",),
+        "IG_OAS":         ("z_score_1y",),
     }
 
     def _compute_fields(s: pd.Series, fields: tuple) -> dict:
@@ -259,9 +276,7 @@ def fetch_fred_indicators() -> dict[str, dict]:
                                   if len(s) >= 30 else np.nan)
         return entry
 
-    def _from_fred(key: str, fields: tuple) -> tuple[str, dict]:
-        """Fetch a single key from FRED CSV. Called sequentially for FRED series
-        to avoid triggering rate-limits from parallel connections."""
+    def _fetch_one(key: str, fields: tuple) -> tuple[str, dict]:
         try:
             s = _fetch_fred_series(FRED_SERIES[key], lookback_days=400)
             if s.empty:
@@ -270,28 +285,24 @@ def fetch_fred_indicators() -> dict[str, dict]:
         except Exception as e:
             return key, {"current": np.nan, "error": str(e)}
 
-    def _ust10_from_yf(fields: tuple) -> tuple[str, dict]:
-        """UST10 via yfinance ^TNX (primary), FRED DGS10 (fallback)."""
-        try:
-            s = _fetch_tnx_series(lookback_days=400)
-            if not s.empty:
-                return "UST10", {**_compute_fields(s, fields), "source": "yfinance ^TNX"}
-        except Exception:
-            pass
-        return _from_fred("UST10", fields)
-
     out: dict[str, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        futures = {
+            pool.submit(_fetch_one, key, fields): key
+            for key, fields in spec.items()
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            key, result = fut.result()
+            out[key] = result
 
-    # UST10 resolved via yfinance (fast, no FRED timeout risk).
-    out["UST10"] = _ust10_from_yf(spec["UST10"])[1]
-
-    # Remaining three series all use FRED. Fetch sequentially to avoid
-    # hammering FRED with parallel connections, which caused DFII10 (REAL_10Y)
-    # to regress from working to timing-out when parallelism was added.
-    for key in ("HY_OAS", "REAL_10Y", "BREAKEVEN_5Y5Y"):
-        _, result = _from_fred(key, spec[key])
-        out[key] = result
-
+    # Derived: mortgage spread (30Y mortgage minus 10Y Treasury).
+    # A wide spread means housing credit is expensive relative to the
+    # general rate level — relevant for XLY (homebuilders) and XLRE.
+    _m30 = out.get("MORTGAGE_30Y", {}).get("current", np.nan)
+    _t10 = out.get("UST10", {}).get("current", np.nan)
+    out["MORTGAGE_SPREAD"] = {
+        "current": float(_m30 - _t10) if (pd.notna(_m30) and pd.notna(_t10)) else np.nan
+    }
     return out
 
 

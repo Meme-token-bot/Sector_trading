@@ -300,15 +300,22 @@ def _macro_readings_for_alignment() -> dict[str, dict]:
 
     fred = _safe(fetch_fred_indicators)
     return {
-        "T10Y2Y":         _safe(yield_curve_spread),
-        "HY_OAS":         fred.get("HY_OAS", {}),
-        "UST10":          fred.get("UST10", {}),
-        "REAL_10Y":       fred.get("REAL_10Y", {}),
-        "BREAKEVEN_5Y5Y": fred.get("BREAKEVEN_5Y5Y", {}),
-        "DXY":            _safe(dxy_level, macro) if not macro.empty else {},
-        "VIX":            _safe(vix_level, macro) if not macro.empty else {},
-        "GOLD_OIL":       _safe(gold_oil_ratio, macro) if not macro.empty else {},
-        "COPPER_GOLD":    _safe(copper_gold_ratio, macro) if not macro.empty else {},
+        "T10Y2Y":          _safe(yield_curve_spread),
+        "HY_OAS":          fred.get("HY_OAS", {}),
+        "UST10":           fred.get("UST10", {}),
+        "REAL_10Y":        fred.get("REAL_10Y", {}),
+        "BREAKEVEN_5Y5Y":  fred.get("BREAKEVEN_5Y5Y", {}),
+        "BREAKEVEN_10Y":   fred.get("BREAKEVEN_10Y", {}),
+        "INIT_CLAIMS":     fred.get("INIT_CLAIMS", {}),
+        "MORTGAGE_30Y":    fred.get("MORTGAGE_30Y", {}),
+        "MORTGAGE_SPREAD": fred.get("MORTGAGE_SPREAD", {}),
+        "FIN_CONDITIONS":  fred.get("FIN_CONDITIONS", {}),
+        "UST2":            fred.get("UST2", {}),
+        "IG_OAS":          fred.get("IG_OAS", {}),
+        "DXY":             _safe(dxy_level, macro) if not macro.empty else {},
+        "VIX":             _safe(vix_level, macro) if not macro.empty else {},
+        "GOLD_OIL":        _safe(gold_oil_ratio, macro) if not macro.empty else {},
+        "COPPER_GOLD":     _safe(copper_gold_ratio, macro) if not macro.empty else {},
     }
 
 
