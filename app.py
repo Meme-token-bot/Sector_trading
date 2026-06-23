@@ -309,6 +309,125 @@ def _structured_why(row: pd.Series) -> str:
     parts.append(f"💬 {sent:+.1f}"     if pd.notna(sent) else "💬 —")
     return "   ".join(parts)
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_rrg_data(as_of_iso: str) -> pd.DataFrame:
+    """RS and 1-week RS-momentum per sector for the Relative Rotation Graph."""
+    prices = _cached_prices()
+    as_of = date.fromisoformat(as_of_iso)
+    metrics_now  = compute_sector_metrics(prices)
+    metrics_prev = compute_sector_metrics(
+        prices, as_of=pd.Timestamp(as_of - timedelta(days=7))
+    )
+    if metrics_now.empty:
+        return pd.DataFrame()
+    rs_now  = metrics_now["relative_strength_3m"] * 100
+    rs_prev = (metrics_prev["relative_strength_3m"] * 100
+               if not metrics_prev.empty else pd.Series(dtype=float))
+    rs_prev_aligned = rs_prev.reindex(rs_now.index).fillna(rs_now)
+    return pd.DataFrame({"rs": rs_now, "rs_momentum": rs_now - rs_prev_aligned})
+
+
+def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
+    """Relative Rotation Graph: RS (x) vs RS-momentum (y) scatter."""
+    import plotly.graph_objects as go
+
+    _BG   = "#0e1117"
+    _PNL  = "#11161d"
+    _GRID = "rgba(255,255,255,0.08)"
+    _QUAD: dict[str, str] = {
+        "Leading":   "#2ecc71",
+        "Weakening": "#f1c40f",
+        "Lagging":   "#e74c3c",
+        "Improving": "#3aa6c4",
+    }
+
+    rs_vals  = rrg_df["rs"].dropna()
+    mom_vals = rrg_df["rs_momentum"].dropna()
+    x_max = max(float(rs_vals.abs().max())  * 1.40, 3.0)
+    y_max = max(float(mom_vals.abs().max()) * 1.40, 0.3)
+
+    fig = go.Figure()
+
+    for x0, x1, y0, y1, quad in [
+        (0,      x_max,  0,      y_max, "Leading"),
+        (0,      x_max, -y_max,  0,     "Weakening"),
+        (-x_max, 0,     -y_max,  0,     "Lagging"),
+        (-x_max, 0,      0,      y_max, "Improving"),
+    ]:
+        c = _QUAD[quad]
+        fig.add_shape(type="rect",
+            x0=x0, x1=x1, y0=y0, y1=y1,
+            fillcolor=f"{c}14", line=dict(width=0), layer="below",
+        )
+        fig.add_annotation(
+            x=(x0 + x1) / 2, y=(y0 + y1) / 2,
+            text=quad, showarrow=False,
+            font=dict(size=12, color=f"{c}66"),
+            xanchor="center", yanchor="middle",
+        )
+
+    for ticker in rrg_df.index:
+        row  = rrg_df.loc[ticker]
+        rs   = float(row["rs"])
+        mom  = float(row["rs_momentum"])
+        quad = ("Leading"   if rs >= 0 and mom >= 0 else
+                "Weakening" if rs >= 0 else
+                "Improving" if mom >= 0 else "Lagging")
+        state = (signals.loc[ticker, "state"]
+                 if ticker in signals.index else "HOLD")
+        name  = SECTOR_ETFS.get(str(ticker), str(ticker))
+        c     = _QUAD[quad]
+        size  = 18 if state in {"NEW_BUY", "HOLD_IF_LONG"} else 13
+        sym   = "x" if state == "SELL" else "circle"
+
+        fig.add_trace(go.Scatter(
+            x=[rs], y=[mom],
+            mode="markers+text",
+            text=[str(ticker)],
+            textposition="top center",
+            textfont=dict(size=10, color=c),
+            marker=dict(
+                size=size, color=c, opacity=0.9, symbol=sym,
+                line=dict(color="rgba(255,255,255,0.5)", width=1),
+            ),
+            hovertemplate=(
+                f"<b>{ticker}</b> — {name}<br>"
+                f"RS 3M vs SPY: {rs:+.2f}%<br>"
+                f"RS Momentum (1W Δ): {mom:+.3f}%<br>"
+                f"Quadrant: {quad}<br>"
+                f"State: {state}<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+
+    fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.30)",
+                                  dash="dash", width=1))
+    fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.30)",
+                                  dash="dash", width=1))
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_BG, plot_bgcolor=_PNL,
+        title=dict(
+            text="Relative Rotation Graph — Sector RS vs RS Momentum",
+            x=0.01, font=dict(size=13),
+        ),
+        xaxis=dict(
+            title="3-month RS vs SPY (%)",
+            showgrid=True, gridcolor=_GRID, zeroline=False,
+            range=[-x_max, x_max],
+        ),
+        yaxis=dict(
+            title="RS Momentum (1-week Δ, %)",
+            showgrid=True, gridcolor=_GRID, zeroline=False,
+            range=[-y_max, y_max],
+        ),
+        height=440,
+        margin=dict(l=10, r=10, t=40, b=40),
+        hovermode="closest",
+    )
+    return fig
+
 
 render_header(
     "📊 Sector Rotation — Macro-Filtered Convergence Model",
@@ -1782,146 +1901,6 @@ def _cached_expression_signals(
         }
         for s in sigs
     ]
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _cached_rrg_data(as_of_iso: str) -> pd.DataFrame:
-    """RS and 1-week RS-momentum per sector for the Relative Rotation Graph.
-
-    Returns a DataFrame indexed by sector ticker with columns:
-      rs          – 3-month relative strength vs SPY (%), current week
-      rs_momentum – week-over-week change in that RS measure (%)
-
-    When prior-week metrics are unavailable (insufficient price history),
-    rs_momentum falls back to 0 so the sector still plots on the graph.
-    """
-    prices = _cached_prices()
-    as_of = date.fromisoformat(as_of_iso)
-    metrics_now  = compute_sector_metrics(prices)
-    metrics_prev = compute_sector_metrics(
-        prices, as_of=pd.Timestamp(as_of - timedelta(days=7))
-    )
-    if metrics_now.empty:
-        return pd.DataFrame()
-    rs_now  = metrics_now["relative_strength_3m"] * 100
-    rs_prev = (metrics_prev["relative_strength_3m"] * 100
-               if not metrics_prev.empty else pd.Series(dtype=float))
-    # Fall back to current RS (momentum=0) when prior week is absent.
-    rs_prev_aligned = rs_prev.reindex(rs_now.index).fillna(rs_now)
-    return pd.DataFrame({"rs": rs_now, "rs_momentum": rs_now - rs_prev_aligned})
-
-
-def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
-    """Relative Rotation Graph: RS (x) vs RS-momentum (y) scatter.
-
-    Four quadrants, colour-coded to match the dashboard state palette:
-      Leading   (RS>0, mom>0) → green   – strong and accelerating
-      Weakening (RS>0, mom<0) → amber   – still leading but fading
-      Lagging   (RS<0, mom<0) → red     – weak and decelerating
-      Improving (RS<0, mom>0) → teal    – turning before price confirms
-
-    Marker size: larger = NEW_BUY / HOLD_IF_LONG. ✕ symbol = SELL.
-    """
-    import plotly.graph_objects as go
-
-    _BG   = "#0e1117"
-    _PNL  = "#11161d"
-    _GRID = "rgba(255,255,255,0.08)"
-    _QUAD: dict[str, str] = {
-        "Leading":   "#2ecc71",
-        "Weakening": "#f1c40f",
-        "Lagging":   "#e74c3c",
-        "Improving": "#3aa6c4",
-    }
-
-    rs_vals  = rrg_df["rs"].dropna()
-    mom_vals = rrg_df["rs_momentum"].dropna()
-    x_max = max(float(rs_vals.abs().max())  * 1.40, 3.0)
-    y_max = max(float(mom_vals.abs().max()) * 1.40, 0.3)
-
-    fig = go.Figure()
-
-    # ---- Quadrant shading + labels ------------------------------------
-    for x0, x1, y0, y1, quad in [
-        (0,      x_max,  0,      y_max, "Leading"),
-        (0,      x_max, -y_max,  0,     "Weakening"),
-        (-x_max, 0,     -y_max,  0,     "Lagging"),
-        (-x_max, 0,      0,      y_max, "Improving"),
-    ]:
-        c = _QUAD[quad]
-        fig.add_shape(type="rect",
-            x0=x0, x1=x1, y0=y0, y1=y1,
-            fillcolor=f"{c}14", line=dict(width=0), layer="below",
-        )
-        fig.add_annotation(
-            x=(x0 + x1) / 2, y=(y0 + y1) / 2,
-            text=quad, showarrow=False,
-            font=dict(size=12, color=f"{c}66"),
-            xanchor="center", yanchor="middle",
-        )
-
-    # ---- One scatter point per sector --------------------------------
-    for ticker in rrg_df.index:
-        row  = rrg_df.loc[ticker]
-        rs   = float(row["rs"])
-        mom  = float(row["rs_momentum"])
-        quad = ("Leading"   if rs >= 0 and mom >= 0 else
-                "Weakening" if rs >= 0 else
-                "Improving" if mom >= 0 else "Lagging")
-        state = (signals.loc[ticker, "state"]
-                 if ticker in signals.index else "HOLD")
-        name  = SECTOR_ETFS.get(str(ticker), str(ticker))
-        c     = _QUAD[quad]
-        size  = 18 if state in {"NEW_BUY", "HOLD_IF_LONG"} else 13
-        sym   = "x" if state == "SELL" else "circle"
-
-        fig.add_trace(go.Scatter(
-            x=[rs], y=[mom],
-            mode="markers+text",
-            text=[str(ticker)],
-            textposition="top center",
-            textfont=dict(size=10, color=c),
-            marker=dict(
-                size=size, color=c, opacity=0.9, symbol=sym,
-                line=dict(color="rgba(255,255,255,0.5)", width=1),
-            ),
-            hovertemplate=(
-                f"<b>{ticker}</b> — {name}<br>"
-                f"RS 3M vs SPY: {rs:+.2f}%<br>"
-                f"RS Momentum (1W Δ): {mom:+.3f}%<br>"
-                f"Quadrant: {quad}<br>"
-                f"State: {state}<extra></extra>"
-            ),
-            showlegend=False,
-        ))
-
-    # ---- Axis dividers -----------------------------------------------
-    fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.30)",
-                                  dash="dash", width=1))
-    fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.30)",
-                                  dash="dash", width=1))
-
-    fig.update_layout(
-        template="plotly_dark",
-        paper_bgcolor=_BG, plot_bgcolor=_PNL,
-        title=dict(
-            text="Relative Rotation Graph — Sector RS vs RS Momentum",
-            x=0.01, font=dict(size=13),
-        ),
-        xaxis=dict(
-            title="3-month RS vs SPY (%)",
-            showgrid=True, gridcolor=_GRID, zeroline=False,
-            range=[-x_max, x_max],
-        ),
-        yaxis=dict(
-            title="RS Momentum (1-week Δ, %)",
-            showgrid=True, gridcolor=_GRID, zeroline=False,
-            range=[-y_max, y_max],
-        ),
-        height=440,
-        margin=dict(l=10, r=10, t=40, b=40),
-        hovermode="closest",
-    )
-    return fig
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_signals_bundle(as_of_iso: str) -> pd.DataFrame:
