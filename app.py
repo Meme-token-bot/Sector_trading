@@ -487,11 +487,22 @@ with tab_dashboard:
             t: _macro_pill_color(_macro_for(t)) for t in display.index
         }
 
-        # New Sentiment format: '+2.1 · n=3 · σ=0.8'
+        def _is_consensus_peak(r: pd.Series) -> bool:
+            """True when sentiment is unusually uniform across many sources —
+            high score, low stdev, sufficient coverage. This is a contrarian
+            caution flag: when every newsletter agrees bullishly, the signal
+            may be closer to peaking than starting."""
+            return (
+                int(r.get("n_obs", 0)) >= 3
+                and float(r.get("score_stdev", 1.0)) < 0.5
+                and float(r.get("sentiment_score", 0.0)) >= 4.0
+            )
+
         display["Sentiment"] = display.apply(
             lambda r: (
                 f"{r['sentiment_score']:+.1f} · n={int(r['n_obs'])} · "
                 f"σ={float(r['score_stdev']):.1f}"
+                + (" ⚠️" if _is_consensus_peak(r) else "")
             ),
             axis=1,
         )
@@ -560,7 +571,12 @@ with tab_dashboard:
                 ),
                 "Sentiment":  st.column_config.TextColumn(
                     "Sentiment", width="small",
-                    help="Mean score · # newsletters reviewed · stdev across them.",
+                    help=(
+                        "Mean score · # newsletters reviewed · stdev across them. "
+                        "⚠️ = consensus peak: n ≥ 3, σ < 0.5, score ≥ +4 — "
+                        "unusually uniform bullishness; treat as a contrarian caution, "
+                        "not a stronger buy signal."
+                    ),
                 ),
                 "State":      st.column_config.TextColumn("State",      width="small"),
                 "Macro":      st.column_config.TextColumn(
@@ -841,6 +857,38 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
                 st.error(f"Tiger fetch failed: {e}")
 
     # ---- Diagnostics footer --------------------------------------------------
+    # ====== Relative Rotation Graph ======================================
+    section(
+        "Sector Rotation Phase Space",
+        help=(
+            "**Leading** (top-right): high RS, rising momentum — stay long. "
+            "**Weakening** (bottom-right): high RS but fading — watch for trim. "
+            "**Improving** (top-left): RS still negative but turning — "
+            "potential early entry *before* RS crosses zero. "
+            "**Lagging** (bottom-left): weak and decelerating — avoid. "
+            "Larger markers = NEW_BUY / HOLD_IF_LONG. ✕ = SELL."
+        ),
+        level=3,
+    )
+    try:
+        _rrg_df = _cached_rrg_data(date.today().isoformat())
+        if not _rrg_df.empty:
+            st.plotly_chart(
+                _build_rrg_chart(_rrg_df, signals),
+                use_container_width=True,
+                key="dashboard_rrg",
+            )
+            st.caption(
+                "X-axis: 3-month RS vs SPY. Y-axis: week-over-week change in that RS. "
+                "Sectors in **Improving** are rotating into favour before the "
+                "convergence model's RS > 0 gate fires — the earliest leading signal "
+                "the price data can give you."
+            )
+        else:
+            st.info("RRG unavailable — insufficient price history.")
+    except Exception as _rrg_err:
+        st.warning(f"RRG unavailable: {_rrg_err}")
+
     st.caption("Diagnostics")
     _diag_col, _ = st.columns([1, 4])
     with _diag_col:
@@ -1565,63 +1613,63 @@ with tab_macro:
                     "reflation; tailwind for XLE, XLB, but watch for hawkish Fed."),
             compact=True,
         )
-    _ri_col5, _ri_col6 = st.columns(2)
-with _ri_col5:
-    _render_macro_indicator(
-        label="2Y nominal",
-        payload=fred.get("UST2", {}),
-        title="2Y Nominal Yield",
-        description=("Constant-maturity 2-year Treasury yield. Primarily driven by "
-                     "Fed expectations — the most sensitive instrument to the "
-                     "interest-rate path. A falling 2Y signals rate cuts ahead."),
-        fmt="{:.2f}%",
-        bands=_UST2_BANDS,
-        signal=("< 3.5% with falling slope → cuts priced; XLRE, XLU, XLK benefit. "
-                "> 4.5% → prolonged tightening expected; XLU, XLRE under pressure. "
-                "Falling faster than 10Y → curve steepening; XLF NIM expands."),
-        delta_kind="slope",
-        compact=True,
-    )
-with _ri_col6:
-    _render_macro_indicator(
-        label="10Y breakeven",
-        payload=fred.get("BREAKEVEN_10Y", {}),
-        title="10Y Breakeven Inflation Rate",
-        description=("T10YIE: 10Y nominal Treasury minus 10Y TIPS. The spot "
-                     "market-implied inflation expectation for the next decade. "
-                     "More actionable for near-term rotation than the 5Y5Y forward."),
-        fmt="{:.2f}%",
-        bands=_BREAKEVEN_10Y_BANDS,
-        signal=("< 2.0% → below-target inflation; XLK, XLRE favoured. "
-                "2.0–2.5% → anchored; neutral. "
-                "> 2.5% → above target; XLE, XLB tailwind; "
-                "XLK headwind from rising real discount rate."),
-        compact=True,
-    )
+        _ri_col5, _ri_col6 = st.columns(2)
+    with _ri_col5:
+        _render_macro_indicator(
+            label="2Y nominal",
+            payload=fred.get("UST2", {}),
+            title="2Y Nominal Yield",
+            description=("Constant-maturity 2-year Treasury yield. Primarily driven by "
+                        "Fed expectations — the most sensitive instrument to the "
+                        "interest-rate path. A falling 2Y signals rate cuts ahead."),
+            fmt="{:.2f}%",
+            bands=_UST2_BANDS,
+            signal=("< 3.5% with falling slope → cuts priced; XLRE, XLU, XLK benefit. "
+                    "> 4.5% → prolonged tightening expected; XLU, XLRE under pressure. "
+                    "Falling faster than 10Y → curve steepening; XLF NIM expands."),
+            delta_kind="slope",
+            compact=True,
+        )
+    with _ri_col6:
+        _render_macro_indicator(
+            label="10Y breakeven",
+            payload=fred.get("BREAKEVEN_10Y", {}),
+            title="10Y Breakeven Inflation Rate",
+            description=("T10YIE: 10Y nominal Treasury minus 10Y TIPS. The spot "
+                        "market-implied inflation expectation for the next decade. "
+                        "More actionable for near-term rotation than the 5Y5Y forward."),
+            fmt="{:.2f}%",
+            bands=_BREAKEVEN_10Y_BANDS,
+            signal=("< 2.0% → below-target inflation; XLK, XLRE favoured. "
+                    "2.0–2.5% → anchored; neutral. "
+                    "> 2.5% → above target; XLE, XLB tailwind; "
+                    "XLK headwind from rising real discount rate."),
+            compact=True,
+        )
 
-_ri_col7, _ = st.columns(2)
-with _ri_col7:
-    _mspread = fred.get("MORTGAGE_SPREAD", {}).get("current")
-    _mspread_str = (
-        f" · spread vs 10Y: {_mspread:+.2f}%"
-        if _mspread and pd.notna(_mspread) else ""
-    )
-    _render_macro_indicator(
-        label="30Y mortgage",
-        payload=fred.get("MORTGAGE_30Y", {}),
-        title=f"30Y Fixed Mortgage Rate{_mspread_str}",
-        description=("MORTGAGE30US: Freddie Mac 30-year fixed rate. The mortgage "
-                     "spread (mortgage minus 10Y Treasury) measures housing credit "
-                     "availability beyond the general rate level — wide spread "
-                     "= housing credit tight even after rate cuts."),
-        fmt="{:.2f}%",
-        bands=_MORTGAGE_BANDS,
-        signal=("< 6.5% → affordable; XLY homebuilders (XHB/ITB) and XLRE bid. "
-                "> 7.5% → housing locked; XLY and XLRE headwind. "
-                "Spread > 2.5% → housing credit tight beyond rate level."),
-        delta_kind="slope",
-        compact=True,
-    )
+    _ri_col7, _ = st.columns(2)
+    with _ri_col7:
+        _mspread = fred.get("MORTGAGE_SPREAD", {}).get("current")
+        _mspread_str = (
+            f" · spread vs 10Y: {_mspread:+.2f}%"
+            if _mspread and pd.notna(_mspread) else ""
+        )
+        _render_macro_indicator(
+            label="30Y mortgage",
+            payload=fred.get("MORTGAGE_30Y", {}),
+            title=f"30Y Fixed Mortgage Rate{_mspread_str}",
+            description=("MORTGAGE30US: Freddie Mac 30-year fixed rate. The mortgage "
+                        "spread (mortgage minus 10Y Treasury) measures housing credit "
+                        "availability beyond the general rate level — wide spread "
+                        "= housing credit tight even after rate cuts."),
+            fmt="{:.2f}%",
+            bands=_MORTGAGE_BANDS,
+            signal=("< 6.5% → affordable; XLY homebuilders (XHB/ITB) and XLRE bid. "
+                    "> 7.5% → housing locked; XLY and XLRE headwind. "
+                    "Spread > 2.5% → housing credit tight beyond rate level."),
+            delta_kind="slope",
+            compact=True,
+        )
 
     with st.expander("📖 How to use this tab — bands & caveats"):
         st.markdown(
@@ -1735,6 +1783,145 @@ def _cached_expression_signals(
         for s in sigs
     ]
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_rrg_data(as_of_iso: str) -> pd.DataFrame:
+    """RS and 1-week RS-momentum per sector for the Relative Rotation Graph.
+
+    Returns a DataFrame indexed by sector ticker with columns:
+      rs          – 3-month relative strength vs SPY (%), current week
+      rs_momentum – week-over-week change in that RS measure (%)
+
+    When prior-week metrics are unavailable (insufficient price history),
+    rs_momentum falls back to 0 so the sector still plots on the graph.
+    """
+    prices = _cached_prices()
+    as_of = date.fromisoformat(as_of_iso)
+    metrics_now  = compute_sector_metrics(prices)
+    metrics_prev = compute_sector_metrics(
+        prices, as_of=pd.Timestamp(as_of - timedelta(days=7))
+    )
+    if metrics_now.empty:
+        return pd.DataFrame()
+    rs_now  = metrics_now["relative_strength_3m"] * 100
+    rs_prev = (metrics_prev["relative_strength_3m"] * 100
+               if not metrics_prev.empty else pd.Series(dtype=float))
+    # Fall back to current RS (momentum=0) when prior week is absent.
+    rs_prev_aligned = rs_prev.reindex(rs_now.index).fillna(rs_now)
+    return pd.DataFrame({"rs": rs_now, "rs_momentum": rs_now - rs_prev_aligned})
+
+
+def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
+    """Relative Rotation Graph: RS (x) vs RS-momentum (y) scatter.
+
+    Four quadrants, colour-coded to match the dashboard state palette:
+      Leading   (RS>0, mom>0) → green   – strong and accelerating
+      Weakening (RS>0, mom<0) → amber   – still leading but fading
+      Lagging   (RS<0, mom<0) → red     – weak and decelerating
+      Improving (RS<0, mom>0) → teal    – turning before price confirms
+
+    Marker size: larger = NEW_BUY / HOLD_IF_LONG. ✕ symbol = SELL.
+    """
+    import plotly.graph_objects as go
+
+    _BG   = "#0e1117"
+    _PNL  = "#11161d"
+    _GRID = "rgba(255,255,255,0.08)"
+    _QUAD: dict[str, str] = {
+        "Leading":   "#2ecc71",
+        "Weakening": "#f1c40f",
+        "Lagging":   "#e74c3c",
+        "Improving": "#3aa6c4",
+    }
+
+    rs_vals  = rrg_df["rs"].dropna()
+    mom_vals = rrg_df["rs_momentum"].dropna()
+    x_max = max(float(rs_vals.abs().max())  * 1.40, 3.0)
+    y_max = max(float(mom_vals.abs().max()) * 1.40, 0.3)
+
+    fig = go.Figure()
+
+    # ---- Quadrant shading + labels ------------------------------------
+    for x0, x1, y0, y1, quad in [
+        (0,      x_max,  0,      y_max, "Leading"),
+        (0,      x_max, -y_max,  0,     "Weakening"),
+        (-x_max, 0,     -y_max,  0,     "Lagging"),
+        (-x_max, 0,      0,      y_max, "Improving"),
+    ]:
+        c = _QUAD[quad]
+        fig.add_shape(type="rect",
+            x0=x0, x1=x1, y0=y0, y1=y1,
+            fillcolor=f"{c}14", line=dict(width=0), layer="below",
+        )
+        fig.add_annotation(
+            x=(x0 + x1) / 2, y=(y0 + y1) / 2,
+            text=quad, showarrow=False,
+            font=dict(size=12, color=f"{c}66"),
+            xanchor="center", yanchor="middle",
+        )
+
+    # ---- One scatter point per sector --------------------------------
+    for ticker in rrg_df.index:
+        row  = rrg_df.loc[ticker]
+        rs   = float(row["rs"])
+        mom  = float(row["rs_momentum"])
+        quad = ("Leading"   if rs >= 0 and mom >= 0 else
+                "Weakening" if rs >= 0 else
+                "Improving" if mom >= 0 else "Lagging")
+        state = (signals.loc[ticker, "state"]
+                 if ticker in signals.index else "HOLD")
+        name  = SECTOR_ETFS.get(str(ticker), str(ticker))
+        c     = _QUAD[quad]
+        size  = 18 if state in {"NEW_BUY", "HOLD_IF_LONG"} else 13
+        sym   = "x" if state == "SELL" else "circle"
+
+        fig.add_trace(go.Scatter(
+            x=[rs], y=[mom],
+            mode="markers+text",
+            text=[str(ticker)],
+            textposition="top center",
+            textfont=dict(size=10, color=c),
+            marker=dict(
+                size=size, color=c, opacity=0.9, symbol=sym,
+                line=dict(color="rgba(255,255,255,0.5)", width=1),
+            ),
+            hovertemplate=(
+                f"<b>{ticker}</b> — {name}<br>"
+                f"RS 3M vs SPY: {rs:+.2f}%<br>"
+                f"RS Momentum (1W Δ): {mom:+.3f}%<br>"
+                f"Quadrant: {quad}<br>"
+                f"State: {state}<extra></extra>"
+            ),
+            showlegend=False,
+        ))
+
+    # ---- Axis dividers -----------------------------------------------
+    fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.30)",
+                                  dash="dash", width=1))
+    fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.30)",
+                                  dash="dash", width=1))
+
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor=_BG, plot_bgcolor=_PNL,
+        title=dict(
+            text="Relative Rotation Graph — Sector RS vs RS Momentum",
+            x=0.01, font=dict(size=13),
+        ),
+        xaxis=dict(
+            title="3-month RS vs SPY (%)",
+            showgrid=True, gridcolor=_GRID, zeroline=False,
+            range=[-x_max, x_max],
+        ),
+        yaxis=dict(
+            title="RS Momentum (1-week Δ, %)",
+            showgrid=True, gridcolor=_GRID, zeroline=False,
+            range=[-y_max, y_max],
+        ),
+        height=440,
+        margin=dict(l=10, r=10, t=40, b=40),
+        hovermode="closest",
+    )
+    return fig
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_signals_bundle(as_of_iso: str) -> pd.DataFrame:
