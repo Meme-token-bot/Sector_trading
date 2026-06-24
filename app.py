@@ -326,12 +326,11 @@ def _cached_rrg_data(as_of_iso: str) -> pd.DataFrame:
     rs_prev_aligned = rs_prev.reindex(rs_now.index).fillna(rs_now)
     return pd.DataFrame({"rs": rs_now, "rs_momentum": rs_now - rs_prev_aligned})
 
-
 def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
     """Relative Rotation Graph: RS (x) vs RS-momentum (y) scatter."""
     import plotly.graph_objects as go
 
-    def _rgba(hex_color: str, alpha: float) -> str:
+    def _hex_to_rgba(hex_color: str, alpha: float) -> str:
         h = hex_color.lstrip("#")
         r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
         return f"rgba({r},{g},{b},{alpha})"
@@ -339,7 +338,7 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
     _BG   = "#0e1117"
     _PNL  = "#11161d"
     _GRID = "rgba(255,255,255,0.08)"
-    _QUAD: dict[str, str] = {
+    _QUAD = {
         "Leading":   "#2ecc71",
         "Weakening": "#f1c40f",
         "Lagging":   "#e74c3c",
@@ -348,7 +347,7 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
 
     rs_vals  = rrg_df["rs"].dropna()
     mom_vals = rrg_df["rs_momentum"].dropna()
-    x_max = max(float(rs_vals.abs().max())  * 1.40, 3.0)
+    x_max = max(float(rs_vals.abs().max()) * 1.40, 3.0)
     y_max = max(float(mom_vals.abs().max()) * 1.40, 0.3)
 
     fig = go.Figure()
@@ -360,26 +359,28 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
         (-x_max, 0,      0,      y_max, "Improving"),
     ]:
         c = _QUAD[quad]
-        fig.add_shape(type="rect",
+        fig.add_shape(
+            type="rect",
             x0=x0, x1=x1, y0=y0, y1=y1,
-            fillcolor=f"{c}14", line=dict(width=0), layer="below",
+            fillcolor=_hex_to_rgba(c, 0.08),
+            line=dict(width=0),
+            layer="below",
         )
         fig.add_annotation(
             x=(x0 + x1) / 2, y=(y0 + y1) / 2,
             text=quad, showarrow=False,
-            font=dict(size=12, color=f"{c}66"),
+            font=dict(size=12, color=_hex_to_rgba(c, 0.40)),
             xanchor="center", yanchor="middle",
         )
 
     for ticker in rrg_df.index:
-        row  = rrg_df.loc[ticker]
-        rs   = float(row["rs"])
-        mom  = float(row["rs_momentum"])
-        quad = ("Leading"   if rs >= 0 and mom >= 0 else
-                "Weakening" if rs >= 0 else
-                "Improving" if mom >= 0 else "Lagging")
-        state = (signals.loc[ticker, "state"]
-                 if ticker in signals.index else "HOLD")
+        row   = rrg_df.loc[ticker]
+        rs    = float(row["rs"])
+        mom   = float(row["rs_momentum"])
+        quad  = ("Leading"   if rs >= 0 and mom >= 0 else
+                 "Weakening" if rs >= 0 else
+                 "Improving" if mom >= 0 else "Lagging")
+        state = signals.loc[ticker, "state"] if ticker in signals.index else "HOLD"
         name  = SECTOR_ETFS.get(str(ticker), str(ticker))
         c     = _QUAD[quad]
         size  = 18 if state in {"NEW_BUY", "HOLD_IF_LONG"} else 13
@@ -405,10 +406,8 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
             showlegend=False,
         ))
 
-    fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.30)",
-                                  dash="dash", width=1))
-    fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.30)",
-                                  dash="dash", width=1))
+    fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.30)", dash="dash", width=1))
+    fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.30)", dash="dash", width=1))
 
     fig.update_layout(
         template="plotly_dark",
