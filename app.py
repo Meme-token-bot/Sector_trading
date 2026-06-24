@@ -331,6 +331,49 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
     """Relative Rotation Graph: RS (x) vs RS-momentum (y) scatter."""
     import plotly.graph_objects as go
 
+    def _rgba(hex_color: str, alpha: float) -> str:
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return f"rgba({r},{g},{b},{alpha})"
+
+    _BG   = "#0e1117"
+    _PNL  = "#11161d"
+    _GRID = "rgba(255,255,255,0.08)"
+    _QUAD: dict[str, str] = {
+        "Leading":   "#2ecc71",
+        "Weakening": "#f1c40f",
+        "Lagging":   "#e74c3c",
+        "Improving": "#3aa6c4",
+    }
+
+    rs_vals  = rrg_df["rs"].dropna()
+    mom_vals = rrg_df["rs_momentum"].dropna()
+    x_max = max(float(rs_vals.abs().max())  * 1.40, 3.0)
+    y_max = max(float(mom_vals.abs().max()) * 1.40, 0.3)
+
+    fig = go.Figure()
+
+    for x0, x1, y0, y1, quad in [
+        (0,      x_max,  0,      y_max, "Leading"),
+        (0,      x_max, -y_max,  0,     "Weakening"),
+        (-x_max, 0,     -y_max,  0,     "Lagging"),
+        (-x_max, 0,      0,      y_max, "Improving"),
+    ]:
+        c = _QUAD[quad]
+        fig.add_shape(
+            type="rect",
+            x0=x0, x1=x1, y0=y0, y1=y1,
+            fillcolor=_rgba(c, 0.08),   # was f"{c}14" — invalid 8-digit hex
+            line=dict(width=0),
+            layer="below",
+        )
+        fig.add_annotation(
+            x=(x0 + x1) / 2, y=(y0 + y1) / 2,
+            text=quad, showarrow=False,
+            font=dict(size=12, color=_rgba(c, 0.40)),   # was f"{c}66"
+            xanchor="center", yanchor="middle",
+        )
+
     _BG   = "#0e1117"
     _PNL  = "#11161d"
     _GRID = "rgba(255,255,255,0.08)"
@@ -427,7 +470,6 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
         hovermode="closest",
     )
     return fig
-
 
 render_header(
     "📊 Sector Rotation — Macro-Filtered Convergence Model",
