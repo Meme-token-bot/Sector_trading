@@ -310,24 +310,61 @@ def _structured_why(row: pd.Series) -> str:
     return "   ".join(parts)
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def _cached_rrg_data(as_of_iso: str) -> pd.DataFrame:
-    """RS and 1-week RS-momentum per sector for the Relative Rotation Graph."""
+def _cached_rrg_data(as_of_iso: str, trail_weeks: int = 26) -> pd.DataFrame:
+    """RS and RS-momentum per sector for the RRG, with a trailing weekly history.
+
+    Returns a tidy DataFrame with columns: week_date (date), ticker (str),
+    rs (float), rs_momentum (float).  Rows run oldest → newest so the last
+    row per ticker is always the current snapshot.  `trail_weeks` = 26 gives
+    roughly 6 months of weekly positions.
+    """
     prices = _cached_prices()
     as_of = date.fromisoformat(as_of_iso)
-    metrics_now  = compute_sector_metrics(prices)
-    metrics_prev = compute_sector_metrics(
-        prices, as_of=pd.Timestamp(as_of - timedelta(days=7))
-    )
-    if metrics_now.empty:
-        return pd.DataFrame()
-    rs_now  = metrics_now["relative_strength_3m"] * 100
-    rs_prev = (metrics_prev["relative_strength_3m"] * 100
-               if not metrics_prev.empty else pd.Series(dtype=float))
-    rs_prev_aligned = rs_prev.reindex(rs_now.index).fillna(rs_now)
-    return pd.DataFrame({"rs": rs_now, "rs_momentum": rs_now - rs_prev_aligned})
 
-def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
-    """Relative Rotation Graph: RS (x) vs RS-momentum (y) scatter."""
+    rows: list[dict] = []
+    for i in range(trail_weeks, -1, -1):
+        snap_date = as_of - timedelta(weeks=i)
+        snap_ts   = pd.Timestamp(snap_date)
+        prev_ts   = pd.Timestamp(snap_date - timedelta(days=7))
+
+        try:
+            metrics_now  = compute_sector_metrics(prices, as_of=snap_ts)
+            metrics_prev = compute_sector_metrics(prices, as_of=prev_ts)
+        except Exception:
+            continue
+
+        if metrics_now.empty:
+            continue
+
+        rs_now  = metrics_now["relative_strength_3m"] * 100
+        rs_prev = (metrics_prev["relative_strength_3m"] * 100
+                   if not metrics_prev.empty else pd.Series(dtype=float))
+        rs_prev_aligned = rs_prev.reindex(rs_now.index).fillna(rs_now)
+
+        for ticker in rs_now.index:
+            rows.append({
+                "week_date":    snap_date,
+                "ticker":       str(ticker),
+                "rs":           float(rs_now[ticker]),
+                "rs_momentum":  float(
+                    rs_now[ticker]
+                    - rs_prev_aligned.get(ticker, rs_now[ticker])
+                ),
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=["week_date", "ticker", "rs", "rs_momentum"])
+    return pd.DataFrame(rows)
+
+def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame,
+                     highlighted: str | None = None) -> go.Figure:
+    """Relative Rotation Graph with 6-month fading trail per sector.
+
+    Pass `highlighted=ticker` to bring that sector's trail to the foreground
+    and dim every other sector.  `None` renders all sectors at equal weight.
+    Clicking any dot (current or historical) passes the ticker via customdata
+    and triggers a session-state rerun — see the RRG section in tab_dashboard.
+    """
     import plotly.graph_objects as go
 
     def _hex_to_rgba(hex_color: str, alpha: float) -> str:
@@ -345,13 +382,14 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
         "Improving": "#3aa6c4",
     }
 
-    rs_vals  = rrg_df["rs"].dropna()
-    mom_vals = rrg_df["rs_momentum"].dropna()
-    x_max = max(float(rs_vals.abs().max()) * 1.40, 3.0)
-    y_max = max(float(mom_vals.abs().max()) * 1.40, 0.3)
+    all_rs  = rrg_df["rs"].dropna()
+    all_mom = rrg_df["rs_momentum"].dropna()
+    x_max = max(float(all_rs.abs().max()) * 1.45, 3.0) if not all_rs.empty else 5.0
+    y_max = max(float(all_mom.abs().max()) * 1.45, 0.5) if not all_mom.empty else 1.0
 
     fig = go.Figure()
 
+    # ── Quadrant shading + labels ────────────────────────────────────────────
     for x0, x1, y0, y1, quad in [
         (0,      x_max,  0,      y_max, "Leading"),
         (0,      x_max, -y_max,  0,     "Weakening"),
@@ -360,60 +398,142 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
     ]:
         c = _QUAD[quad]
         fig.add_shape(
-            type="rect",
-            x0=x0, x1=x1, y0=y0, y1=y1,
-            fillcolor=_hex_to_rgba(c, 0.08),
-            line=dict(width=0),
-            layer="below",
+            type="rect", x0=x0, x1=x1, y0=y0, y1=y1,
+            fillcolor=_hex_to_rgba(c, 0.08), line=dict(width=0), layer="below",
         )
         fig.add_annotation(
             x=(x0 + x1) / 2, y=(y0 + y1) / 2,
             text=quad, showarrow=False,
-            font=dict(size=12, color=_hex_to_rgba(c, 0.40)),
+            font=dict(size=12, color=_hex_to_rgba(c, 0.35)),
             xanchor="center", yanchor="middle",
         )
 
-    for ticker in rrg_df.index:
-        row   = rrg_df.loc[ticker]
-        rs    = float(row["rs"])
-        mom   = float(row["rs_momentum"])
-        quad  = ("Leading"   if rs >= 0 and mom >= 0 else
-                 "Weakening" if rs >= 0 else
-                 "Improving" if mom >= 0 else "Lagging")
+    # ── Per-ticker traces ────────────────────────────────────────────────────
+    for ticker in rrg_df["ticker"].unique():
+        tk = rrg_df[rrg_df["ticker"] == ticker].sort_values("week_date")
+        if tk.empty:
+            continue
+
+        cur     = tk.iloc[-1]
+        rs_cur  = float(cur["rs"])
+        mom_cur = float(cur["rs_momentum"])
+        hist    = tk.iloc[:-1]
+
+        quad  = ("Leading"   if rs_cur >= 0 and mom_cur >= 0 else
+                 "Weakening" if rs_cur >= 0 else
+                 "Improving" if mom_cur >= 0 else "Lagging")
         state = signals.loc[ticker, "state"] if ticker in signals.index else "HOLD"
         name  = SECTOR_ETFS.get(str(ticker), str(ticker))
         c     = _QUAD[quad]
-        size  = 18 if state in {"NEW_BUY", "HOLD_IF_LONG"} else 13
-        sym   = "x" if state == "SELL" else "circle"
 
+        is_focus  = (highlighted == ticker)
+        is_active = (highlighted is None or is_focus)
+
+        # ── Rendering params vary by highlight mode ────────────────────────
+        if highlighted is None:
+            line_a, line_w, line_d = 0.22, 1.5, "dot"
+            dot_min, dot_max       = 0.07, 0.45
+            dot_sz                 = 5
+            cur_a, cur_sz          = 0.95, (18 if state in {"NEW_BUY", "HOLD_IF_LONG"} else 13)
+            txt_a                  = 1.0
+        elif is_focus:
+            line_a, line_w, line_d = 0.90, 3.0, "solid"
+            dot_min, dot_max       = 0.30, 0.85
+            dot_sz                 = 8
+            cur_a, cur_sz          = 1.0,  (22 if state in {"NEW_BUY", "HOLD_IF_LONG"} else 17)
+            txt_a                  = 1.0
+        else:
+            line_a, line_w, line_d = 0.04, 0.8, "dot"
+            dot_min, dot_max       = 0.02, 0.06
+            dot_sz                 = 3
+            cur_a, cur_sz          = 0.18, (9 if state in {"NEW_BUY", "HOLD_IF_LONG"} else 7)
+            txt_a                  = 0.20
+
+        # ── Trail line ────────────────────────────────────────────────────
+        if not hist.empty:
+            fig.add_trace(go.Scatter(
+                x=list(hist["rs"]) + [rs_cur],
+                y=list(hist["rs_momentum"]) + [mom_cur],
+                mode="lines",
+                line=dict(color=_hex_to_rgba(c, line_a), width=line_w, dash=line_d),
+                showlegend=False,
+                hoverinfo="skip",
+                legendgroup=ticker,
+                name=f"{ticker}_trail",
+            ))
+
+        # ── Historical dots (opacity ramps oldest→newest) ─────────────────
+        # customdata stores [ticker, week_date] so clicking any dot
+        # identifies the sector for the highlight interaction.
+        if not hist.empty:
+            n = len(hist)
+            alphas     = [dot_min + (dot_max - dot_min) * (i / max(n - 1, 1))
+                          for i in range(n)]
+            dot_colors = [_hex_to_rgba(c, a) for a in alphas]
+            week_strs  = [d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)
+                          for d in hist["week_date"]]
+            cd_hist    = [[ticker, w] for w in week_strs]   # [ticker, date] per point
+            fig.add_trace(go.Scatter(
+                x=list(hist["rs"]),
+                y=list(hist["rs_momentum"]),
+                mode="markers",
+                marker=dict(size=dot_sz, color=dot_colors, line=dict(width=0)),
+                showlegend=False,
+                customdata=cd_hist,
+                hovertemplate=(
+                    f"<b>{ticker}</b> — {name}<br>"
+                    "Week: %{customdata[1]}<br>"
+                    "RS 3M vs SPY: %{x:.2f}%<br>"
+                    "RS Momentum: %{y:.3f}%<br>"
+                    "<i>Click to highlight</i><extra></extra>"
+                ) if is_active else None,
+                hoverinfo="skip" if not is_active else "all",
+                legendgroup=ticker,
+                name=f"{ticker}_hist",
+            ))
+
+        # ── Current dot + label ───────────────────────────────────────────
+        # customdata stores [ticker] so the selection handler can identify
+        # which sector was clicked.
+        sym = "x" if state == "SELL" else "circle"
         fig.add_trace(go.Scatter(
-            x=[rs], y=[mom],
+            x=[rs_cur], y=[mom_cur],
             mode="markers+text",
             text=[str(ticker)],
             textposition="top center",
-            textfont=dict(size=10, color=c),
+            textfont=dict(size=10 if is_active else 8,
+                          color=_hex_to_rgba(c, txt_a)),
             marker=dict(
-                size=size, color=c, opacity=0.9, symbol=sym,
-                line=dict(color="rgba(255,255,255,0.5)", width=1),
+                size=cur_sz,
+                color=_hex_to_rgba(c, cur_a),
+                symbol=sym,
+                line=dict(color=f"rgba(255,255,255,{0.6 if is_active else 0.1})",
+                          width=1.5 if is_focus else 0.8),
             ),
+            customdata=[[ticker]],   # [ticker] per point; picked up by on_select
             hovertemplate=(
                 f"<b>{ticker}</b> — {name}<br>"
-                f"RS 3M vs SPY: {rs:+.2f}%<br>"
-                f"RS Momentum (1W Δ): {mom:+.3f}%<br>"
+                f"RS 3M vs SPY: {rs_cur:+.2f}%<br>"
+                f"RS Momentum (1W Δ): {mom_cur:+.3f}%<br>"
                 f"Quadrant: {quad}<br>"
-                f"State: {state}<extra></extra>"
+                f"State: {state}<br>"
+                "<i>Click to highlight · click again to reset</i>"
+                "<extra></extra>"
             ),
             showlegend=False,
+            legendgroup=ticker,
+            name=ticker,
         ))
 
     fig.add_vline(x=0, line=dict(color="rgba(255,255,255,0.30)", dash="dash", width=1))
     fig.add_hline(y=0, line=dict(color="rgba(255,255,255,0.30)", dash="dash", width=1))
 
+    _suffix = f" — {highlighted} highlighted (click again to reset)" if highlighted else ""
     fig.update_layout(
         template="plotly_dark",
         paper_bgcolor=_BG, plot_bgcolor=_PNL,
         title=dict(
-            text="Relative Rotation Graph — Sector RS vs RS Momentum",
+            text=f"Relative Rotation Graph — 6-month trail{_suffix}",
             x=0.01, font=dict(size=13),
         ),
         xaxis=dict(
@@ -426,7 +546,9 @@ def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame):
             showgrid=True, gridcolor=_GRID, zeroline=False,
             range=[-y_max, y_max],
         ),
-        height=440,
+        clickmode="event+select",   # required for on_select to capture point clicks
+        dragmode="pan",
+        height=500,
         margin=dict(l=10, r=10, t=40, b=40),
         hovermode="closest",
     )
@@ -988,24 +1110,57 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
             "**Improving** (top-left): RS still negative but turning — "
             "potential early entry *before* RS crosses zero. "
             "**Lagging** (bottom-left): weak and decelerating — avoid. "
-            "Larger markers = NEW_BUY / HOLD_IF_LONG. ✕ = SELL."
+            "Larger markers = NEW_BUY / HOLD_IF_LONG. ✕ = SELL. "
+            "**Click any dot or trail point to isolate that sector's path.**"
         ),
         level=3,
     )
     try:
         _rrg_df = _cached_rrg_data(date.today().isoformat())
         if not _rrg_df.empty:
-            st.plotly_chart(
-                _build_rrg_chart(_rrg_df, signals),
+            _rrg_highlight = st.session_state.get("rrg_selected_ticker")
+
+            _rrg_event = st.plotly_chart(
+                _build_rrg_chart(_rrg_df, signals, highlighted=_rrg_highlight),
                 use_container_width=True,
                 key="dashboard_rrg",
+                on_select="rerun",
             )
-            st.caption(
-                "X-axis: 3-month RS vs SPY. Y-axis: week-over-week change in that RS. "
-                "Sectors in **Improving** are rotating into favour before the "
-                "convergence model's RS > 0 gate fires — the earliest leading signal "
-                "the price data can give you."
+
+            # ── Resolve clicked ticker from the selection event ────────────
+            # Current dots carry customdata=[[ticker]], historical dots carry
+            # customdata=[[ticker, date_str]].  Both put the ticker at index 0.
+            _clicked = None
+            if (_rrg_event
+                    and hasattr(_rrg_event, "selection")
+                    and _rrg_event.selection.points):
+                _pt = _rrg_event.selection.points[0]
+                _cd = _pt.get("customdata")
+                if isinstance(_cd, (list, tuple)) and len(_cd) > 0:
+                    _candidate = str(_cd[0])
+                    if _candidate in SECTOR_ETFS:
+                        _clicked = _candidate
+                elif isinstance(_cd, str) and _cd in SECTOR_ETFS:
+                    _clicked = _cd
+
+            if _clicked is not None:
+                # Toggle: clicking the active sector deselects it.
+                new_hl = None if _clicked == _rrg_highlight else _clicked
+                st.session_state["rrg_selected_ticker"] = new_hl
+                st.rerun()
+
+            # ── Caption + clear button ─────────────────────────────────────
+            _cap_col, _btn_col = st.columns([5, 1])
+            _cap_col.caption(
+                "X-axis: 3-month RS vs SPY. Y-axis: week-over-week change in RS. "
+                "Dotted trail = 26-week history; opacity increases toward the present. "
+                "**Click any dot or trail point to highlight that sector; click again to reset.**"
             )
+            if _rrg_highlight:
+                if _btn_col.button("✕ Clear", key="rrg_clear_btn",
+                                   use_container_width=True):
+                    st.session_state["rrg_selected_ticker"] = None
+                    st.rerun()
         else:
             st.info("RRG unavailable — insufficient price history.")
     except Exception as _rrg_err:
