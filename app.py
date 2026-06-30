@@ -313,13 +313,24 @@ def _structured_why(row: pd.Series) -> str:
 def _cached_rrg_data(as_of_iso: str, trail_weeks: int = 26) -> pd.DataFrame:
     """RS and RS-momentum per sector for the RRG, with a trailing weekly history.
 
-    Returns a tidy DataFrame with columns: week_date (date), ticker (str),
-    rs (float), rs_momentum (float).  Rows run oldest → newest so the last
-    row per ticker is always the current snapshot.  `trail_weeks` = 26 gives
-    roughly 6 months of weekly positions.
+    Sourced from the LOCAL prices.db cache (~5y of history) rather than the
+    400-day live yfinance fetch used elsewhere on the Dashboard. The 26-week
+    trail needs SMA200 warmup (~200 trading days) available *before* the
+    OLDEST requested snapshot — roughly 26 weeks + 200 trading days + a
+    buffer. The 400-day cache doesn't reach that far back, which was
+    silently truncating the trail to ~15-17 weeks and dropping the rest.
+    Returns a tidy DataFrame: week_date (date), ticker (str), rs (float),
+    rs_momentum (float). Rows run oldest -> newest.
     """
-    prices = _cached_prices()
     as_of = date.fromisoformat(as_of_iso)
+    fetch_start = as_of - timedelta(weeks=trail_weeks) - timedelta(days=320)
+
+    tickers = list(SECTOR_ETFS.keys()) + [BENCHMARK]
+    wide = load_ohlcv_multi(tickers, "1d", start=fetch_start, end=as_of)
+    if wide.empty:
+        return pd.DataFrame(columns=["week_date", "ticker", "rs", "rs_momentum"])
+    prices = wide.xs("close", axis=1, level=1).sort_index()
+    prices.index = pd.to_datetime(prices.index)
 
     rows: list[dict] = []
     for i in range(trail_weeks, -1, -1):
@@ -332,7 +343,6 @@ def _cached_rrg_data(as_of_iso: str, trail_weeks: int = 26) -> pd.DataFrame:
             metrics_prev = compute_sector_metrics(prices, as_of=prev_ts)
         except Exception:
             continue
-
         if metrics_now.empty:
             continue
 
@@ -343,18 +353,38 @@ def _cached_rrg_data(as_of_iso: str, trail_weeks: int = 26) -> pd.DataFrame:
 
         for ticker in rs_now.index:
             rows.append({
-                "week_date":    snap_date,
-                "ticker":       str(ticker),
-                "rs":           float(rs_now[ticker]),
-                "rs_momentum":  float(
-                    rs_now[ticker]
-                    - rs_prev_aligned.get(ticker, rs_now[ticker])
+                "week_date":   snap_date,
+                "ticker":      str(ticker),
+                "rs":          float(rs_now[ticker]),
+                "rs_momentum": float(
+                    rs_now[ticker] - rs_prev_aligned.get(ticker, rs_now[ticker])
                 ),
             })
 
     if not rows:
         return pd.DataFrame(columns=["week_date", "ticker", "rs", "rs_momentum"])
     return pd.DataFrame(rows)
+
+def _smooth_rrg_trail(rrg_df: pd.DataFrame, span: int = 3) -> pd.DataFrame:
+    """EMA-smooth `rs` and `rs_momentum` per ticker, oldest -> newest.
+
+    Pure function over the tidy frame from `_cached_rrg_data`. Raw weekly RS
+    deltas are a derivative of a rolling 3-month return, which makes them
+    noisy on their own -- this mirrors the classic RRG convention of
+    smoothing both the RS-Ratio and RS-Momentum axes with an EMA before
+    plotting, so the trail reads as a coherent rotation arc rather than a
+    sawtooth. `span=3` is roughly a 3-week EMA; `adjust=False` so the
+    smoother only looks backward (no look-ahead into future weeks).
+    """
+    if rrg_df.empty:
+        return rrg_df
+    out = rrg_df.sort_values(["ticker", "week_date"]).copy()
+    for col in ("rs", "rs_momentum"):
+        out[col] = (
+            out.groupby("ticker")[col]
+               .transform(lambda s: s.ewm(span=span, adjust=False).mean())
+        )
+    return out
 
 def _build_rrg_chart(rrg_df: pd.DataFrame, signals: pd.DataFrame,
                      highlighted: str | None = None) -> go.Figure:
@@ -1116,9 +1146,26 @@ where the raw convergence test passed. `Ext vs SMA` = (price − SMA200) / SMA20
         level=3,
     )
     try:
-        _rrg_df = _cached_rrg_data(date.today().isoformat())
-        if not _rrg_df.empty:
+        _rrg_df_raw = _cached_rrg_data(date.today().isoformat())
+        if not _rrg_df_raw.empty:
             _rrg_highlight = st.session_state.get("rrg_selected_ticker")
+
+            _smooth_col, _ = st.columns([2, 5])
+            with _smooth_col:
+                _rrg_smooth = st.checkbox(
+                    "Smooth trail (3-week EMA)",
+                    value=True,
+                    key="rrg_smooth_toggle",
+                    help=(
+                        "Raw week-over-week RS deltas are noisy on their own "
+                        "(a derivative of a rolling 3-month return). EMA-"
+                        "smoothing both axes is the standard RRG convention "
+                        "and turns the trail into a readable arc. Uncheck "
+                        "to see the unsmoothed weekly snapshots."
+                    ),
+                )
+            _rrg_df = (_smooth_rrg_trail(_rrg_df_raw, span=3)
+                       if _rrg_smooth else _rrg_df_raw)
 
             _rrg_event = st.plotly_chart(
                 _build_rrg_chart(_rrg_df, signals, highlighted=_rrg_highlight),
