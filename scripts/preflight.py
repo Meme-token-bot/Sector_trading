@@ -145,7 +145,7 @@ def check_model_state() -> tuple[list[dict], dict]:
         from src.regime_analysis import classify_regimes
         from src.signal_history import build_signal_history
         from src.signals import build_signals, refine_signals, target_weights
-        closes, _ = load_price_panel()
+        closes, _ = load_price_panel(tickers=list(SECTOR_ETFS.keys()) + [BENCHMARK])
         spy_close = closes[BENCHMARK].dropna()
         regimes = classify_regimes(spy_close)
         current_regime = str(regimes.iloc[-1])

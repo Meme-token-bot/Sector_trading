@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from config.settings import PARAMS
+from config.settings import PARAMS, SUPPLEMENTARY_SECTORS
 
 
 def build_signals(metrics: pd.DataFrame,
@@ -32,7 +32,24 @@ def build_signals(metrics: pd.DataFrame,
         else:
             df[col] = default
 
-    max_rank = df["rs_rank"].max()
+    # Re-rank relative strength among the core (non-supplementary) universe
+    # only, matching src/backtest.py's _universe() which explicitly filters
+    # SUPPLEMENTARY_SECTORS. The bottom-3 RS-rank SELL gate must fire on the
+    # same core sectors regardless of whether UFO (or any future supplementary
+    # sector) happens to occupy a rank slot in the full 12-sector pool.
+    # Without this, UFO absorbing a low-rank slot silently spares a core
+    # sector from SELL that the backtest would have flagged — the parity gap
+    # the backtest's documented invariant was designed to prevent.
+    core_mask = ~df.index.isin(SUPPLEMENTARY_SECTORS)
+    if core_mask.any():
+        df.loc[core_mask, "rs_rank"] = (
+            df.loc[core_mask, "relative_strength_3m"]
+            .rank(ascending=False, method="min")
+            .astype(int)
+        )
+        max_rank = int(df.loc[core_mask, "rs_rank"].max())
+    else:
+        max_rank = int(df["rs_rank"].max())
     weak_threshold = max(max_rank - PARAMS.weak_rs_rank_cutoff + 1, 1)
 
     signals: list[str] = []
@@ -41,7 +58,11 @@ def build_signals(metrics: pd.DataFrame,
         sell_reasons = []
         if not row["above_sma"]:
             sell_reasons.append("price<SMA200")
-        if row["rs_rank"] >= weak_threshold:
+        # Supplementary sectors are tactical overlays outside the equal-weight
+        # rotation pool. They are never SELL solely due to weak cross-sectional
+        # rank — only due to SMA200 break or sentiment floor, which are
+        # absolute conditions that make sense for any sector.
+        if row["rs_rank"] >= weak_threshold and tkr not in SUPPLEMENTARY_SECTORS:
             sell_reasons.append(f"RS rank {int(row['rs_rank'])}/{int(max_rank)} (bottom {PARAMS.weak_rs_rank_cutoff})")
         if row["sentiment_score"] <= PARAMS.sell_sentiment_threshold:
             sell_reasons.append(f"sentiment {row['sentiment_score']:+.1f}<={PARAMS.sell_sentiment_threshold:+.0f}")
@@ -79,7 +100,6 @@ def build_signals(metrics: pd.DataFrame,
     df["signal"] = signals
     df["reasons"] = reasons
     return df
-
 
 def _macro_net(macro_alignment: pd.DataFrame | None, tkr: str) -> int | None:
     """Net macro reading for a ticker = tailwinds - headwinds.

@@ -650,6 +650,18 @@ with tab_dashboard:
                 held_sectors = {
                     s for s, v in current_value_by_sector.items() if v > 0
                 }
+                # Supplementary sectors (e.g. UFO/Space) are intentionally stashed in
+                # attrs["supplementary"] by compute_drift_by_sector to keep them out
+                # of the equal-weight drift comparison — but that exclusion propagates
+                # into the orders panel and silently drops SELL/REDUCE rows for any
+                # tactical overlay we actually hold. Merge them back here; the drift
+                # table below is unaffected since it reads from the drift frame
+                # directly, not from these dicts.
+                for _s_tkr, _s_mv in _drift_for_held.attrs.get("supplementary", {}).items():
+                    _s_mv_f = float(_s_mv)
+                    current_value_by_sector[_s_tkr] = _s_mv_f
+                    if _s_mv_f > 0:
+                        held_sectors.add(_s_tkr)
             except Exception:
                 # Tiger configured but the snapshot fetch blew up — fall back
                 # to "all sectors potentially held" so SELL rows still render.
