@@ -44,7 +44,17 @@ def compute_sector_metrics(prices: pd.DataFrame,
     if len(prices) < mom_window + 1:
         return pd.DataFrame()
 
-    spy_ret = prices[BENCHMARK].iloc[-1] / prices[BENCHMARK].iloc[-mom_window - 1] - 1
+    # Use SPY's own valid closes (mirrors the per-ticker dropna below). If
+    # the raw merged frame has a NaN for the benchmark on the most recent
+    # bar (or the bar mom_window back) while other tickers have data that
+    # day, indexing the raw column directly makes spy_ret NaN — and since
+    # it's subtracted from every sector's return, that poisons
+    # relative_strength_3m for ALL sectors at once, which is what crashed
+    # the downstream .rank().astype(int) call.
+    spy_close = prices[BENCHMARK].dropna()
+    if len(spy_close) < mom_window + 1:
+        return pd.DataFrame()
+    spy_ret = float(spy_close.iloc[-1] / spy_close.iloc[-mom_window - 1] - 1)
 
     rows: list[dict] = []
     for tkr in SECTOR_ETFS:
@@ -56,6 +66,13 @@ def compute_sector_metrics(prices: pd.DataFrame,
         price = float(s.iloc[-1])
         sma = float(s.rolling(sma_window).mean().iloc[-1])
         ret_3m = float(s.iloc[-1] / s.iloc[-mom_window - 1] - 1)
+        rs_3m = ret_3m - spy_ret
+        if not np.isfinite(rs_3m):
+            # A bad print anywhere in this ticker's own window can still
+            # yield a non-finite RS (e.g. a $0.00 glitch tick). Skip it
+            # for this snapshot rather than corrupt every other sector's
+            # rank — same philosophy as the sma_window length guard above.
+            continue
         rows.append({
             "ticker": tkr,
             "name": SECTOR_ETFS[tkr],
@@ -64,8 +81,8 @@ def compute_sector_metrics(prices: pd.DataFrame,
             "above_sma": price > sma,
             "extension_pct": (price - sma) / sma if sma else 0.0,
             "return_3m": ret_3m,
-            "spy_return_3m": float(spy_ret),
-            "relative_strength_3m": ret_3m - float(spy_ret),
+            "spy_return_3m": spy_ret,
+            "relative_strength_3m": rs_3m,
         })
 
     if not rows:
