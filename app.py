@@ -168,6 +168,27 @@ def _cached_macro_alignment_frame() -> pd.DataFrame:
     from src.macro_alignment import compute_macro_alignment
     return compute_macro_alignment(_cached_macro_bundle())
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_regime_and_breadth(as_of_iso: str) -> dict:
+    from src.regime_snapshot import compute_regime_and_breadth
+    prices = _cached_prices()
+    metrics = compute_sector_metrics(prices)
+    spy_close = prices[BENCHMARK] if BENCHMARK in prices.columns else pd.Series(dtype=float)
+    return compute_regime_and_breadth(spy_close, metrics)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_walk_forward_verdict() -> dict | None:
+    import json
+    from pathlib import Path
+    from config.settings import DATA_DIR
+    path = Path(DATA_DIR) / "walk_forward_status.json"
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
 
 @st.cache_data(ttl=10 * 60, show_spinner=False)
 def _cached_theme_sentiment_frames(as_of_iso: str) -> dict:
@@ -266,6 +287,15 @@ def _format_conviction(n: int) -> str:
     n = max(0, min(5, n))
     return "●" * n + "○" * (5 - n)
 
+def _wilson_ci(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    if n <= 0:
+        return 0.0, 1.0
+    p = hits / n
+    denom = 1.0 + (z ** 2) / n
+    center = p + (z ** 2) / (2 * n)
+    margin = z * ((p * (1 - p) / n + (z ** 2) / (4 * n ** 2)) ** 0.5)
+    lo, hi = (center - margin) / denom, (center + margin) / denom
+    return max(0.0, lo), min(1.0, hi)
 
 def _format_macro_pill(row: pd.Series) -> str:
     """Render a macro-alignment row as 'tailwinds/total ✓' or '—' when no
@@ -623,6 +653,45 @@ with tab_dashboard:
             # A persistence hiccup must NEVER break the dashboard render.
             pass
 
+    section("Decision Cockpit", level=3)
+    try:
+        _rb = _cached_regime_and_breadth(date.today().isoformat())
+    except Exception:
+        _rb = None
+    _cockpit_cols = st.columns(4)
+    if _rb is not None:
+        _rc = {"BULL": "#2ecc71", "CORRECTION": "#f1c40f", "BEAR": "#e74c3c"}.get(_rb["regime"], "#888888")
+        _cockpit_cols[0].markdown(
+            f"<div style='font-size:11px;color:#888;'>REGIME</div>"
+            f"<div style='font-size:20px;font-weight:700;color:{_rc};'>{_rb['regime']} "
+            f"<span style='font-size:12px;color:#888;font-weight:400;'>· {_rb['regime_days']}d</span></div>",
+            unsafe_allow_html=True)
+        _cockpit_cols[1].markdown(
+            f"<div style='font-size:11px;color:#888;'>BREADTH</div>"
+            f"<div style='font-size:20px;font-weight:700;'>{_rb['n_above_sma']}/{_rb['n_core']} "
+            f"<span style='font-size:12px;color:#888;font-weight:400;'>above SMA200</span></div>",
+            unsafe_allow_html=True)
+        from src.regime_snapshot import dispersion_band
+        _de, _dl = dispersion_band(_rb["rs_dispersion_pct"])
+        _dv = f"{_rb['rs_dispersion_pct']:.1f}pp" if pd.notna(_rb["rs_dispersion_pct"]) else "—"
+        _cockpit_cols[2].markdown(
+            f"<div style='font-size:11px;color:#888;'>RS DISPERSION</div>"
+            f"<div style='font-size:20px;font-weight:700;'>{_dv} {_de}</div>"
+            f"<div style='font-size:11px;color:#888;'>{_dl}</div>", unsafe_allow_html=True)
+    _wf = _cached_walk_forward_verdict()
+    with _cockpit_cols[3]:
+        if _wf is None:
+            st.markdown("<div style='font-size:11px;color:#888;'>WALK-FORWARD</div>"
+                        "<div style='font-size:13px;color:#888;'>not yet run — "
+                        "see scripts/run_walk_forward.py</div>", unsafe_allow_html=True)
+        else:
+            _kept = sum(1 for v in _wf.get("verdicts", {}).values() if v.get("changed") is False)
+            _total = len(_wf.get("verdicts", {}))
+            st.markdown(f"<div style='font-size:11px;color:#888;'>WALK-FORWARD</div>"
+                       f"<div style='font-size:13px;'>validated {_wf.get('generated_at','—')} — "
+                       f"{_kept}/{_total} defaults kept OOS</div>", unsafe_allow_html=True)
+    st.divider()
+
     left, right = st.columns([3, 2], gap="large")
 
     with left:
@@ -670,6 +739,13 @@ with tab_dashboard:
                 current_value_by_sector = {}
         else:
             held_sectors = set(SECTOR_ETFS.keys())
+
+        def _liquidity_caveat(sector, vehicle):
+            from config.expressions import EXPRESSIONS
+            for e in EXPRESSIONS.get(sector, []):
+                if e.ticker == vehicle and any(k in (e.note or "").lower() for k in ("thin", "options-like")):
+                    return f" ⚠ {e.note}"
+            return ""
 
         orders_rows: list[dict] = []
         for tkr, row in signals.iterrows():
@@ -851,9 +927,10 @@ with tab_dashboard:
                 "Conviction": st.column_config.TextColumn(
                     "Conviction", width="small",
                     help=("0–5 score: +1 each for RS>0, RS>strong, sentiment "
-                          "strong, ≥2 weeks BUY, macro tailwinds ≥ headwinds. "
-                          "Macro contributes 0 when macro data is unavailable "
-                          "— practical max is 4 in that case."),
+                          "strong, ≥2 weeks BUY. Macro is SYMMETRIC, not "
+                          "additive-only: a clear net tailwind (≥+1) adds a "
+                          "point, a clear net headwind (≤-1) SUBTRACTS one "
+                          "(floored at 0). Macro contributes 0 when unavailable."),
                 ),
                 "Sentiment":  st.column_config.TextColumn(
                     "Sentiment", width="small",
@@ -905,11 +982,11 @@ with tab_dashboard:
             horizon_label = ("hold-to-state-exit"
                              if horizon == "next_state_exit"
                              else "1-week")
+            _lo_p, _hi_p = _wilson_ci(int(round(perf["hit_rate"] * perf["n_signals"])), perf["n_signals"])
             st.caption(
                 f"{label} signals, last 12 weeks ({horizon_label}{hold_str}): "
-                f"hit rate {perf['hit_rate']*100:.0f}%, mean excess return "
-                f"{perf['mean_excess_return']*100:+.1f}% vs {BENCHMARK} "
-                f"(n={perf['n_signals']})"
+                f"hit rate {perf['hit_rate']*100:.0f}% (95% CI {_lo_p*100:.0f}–{_hi_p*100:.0f}%), "
+                f"mean excess return {perf['mean_excess_return']*100:+.1f}% vs {BENCHMARK} (n={perf['n_signals']})"
             )
 
         _has_buy_signals = not targets.empty
