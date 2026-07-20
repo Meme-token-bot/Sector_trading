@@ -15,6 +15,12 @@ Procedure:
      1D-chosen values don't conflict with each other.
   4. Write `WALK_FORWARD_REPORT.md` with the per-param tables and the joint
      verdict. Print the suggested PARAMS diff to stdout.
+  5. Write `data/walk_forward_status.json` — a small machine-readable verdict
+     summary the Dashboard's Decision Cockpit reads to render a one-line
+     "walk-forward validated as of DATE, N/M defaults kept OOS" trust badge
+     (TRADING_EDGE_AUDIT.md item B3). This is deliberately NOT the full
+     report — just enough for the badge. The full per-fold detail stays in
+     WALK_FORWARD_REPORT.md, which this script also still writes.
 
 Nothing here mutates `config/settings.py`. Apply the diff manually if you
 agree with it.
@@ -36,6 +42,7 @@ from src.walk_forward import (
     WalkForwardConfig,
     _CFG_FIELDS,
     build_folds,
+    build_status_payload,
     pick_robust_winner,
     sweep_1d,
 )
@@ -60,7 +67,6 @@ def _pct(x: float, p: int = 2, signed: bool = True) -> str:
 
 def _render_param_section(param: str, result: ParamSweepResult,
                           winner: Any, why: str) -> str:
-    """One section per parameter for the report."""
     lines: list[str] = []
     lines.append(f"### `{param}`  (default {result.default_value})")
     lines.append("")
@@ -88,10 +94,6 @@ def _render_param_section(param: str, result: ParamSweepResult,
 def _joint_validation(winners: dict[str, Any],
                       wfc: WalkForwardConfig,
                       closes, opens) -> dict:
-    """Walk-forward-score the JOINT winner config vs the current defaults.
-
-    Same fold schedule as the 1D sweeps. Returns mean OOS CAGR and per-fold
-    rows so the report can show whether the parameters compose."""
     folds = build_folds(closes, wfc)
     param_overrides = {k: v for k, v in winners.items() if k not in _CFG_FIELDS}
     cfg_field_overrides = {k: v for k, v in winners.items() if k in _CFG_FIELDS}
@@ -105,11 +107,11 @@ def _joint_validation(winners: dict[str, Any],
         )
         try:
             r_def = run_backtest(cfg_def, closes=closes, opens=opens)
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
         try:
             r_new = run_backtest(cfg_new, closes=closes, opens=opens)
-        except Exception:  # noqa: BLE001
+        except Exception:
             continue
         rows.append({
             "fold": i + 1,
@@ -174,6 +176,9 @@ def main() -> int:
     ap.add_argument("--metric", default="excess_cagr",
                     choices=["excess_cagr", "cagr", "sharpe"])
     ap.add_argument("--report", default="WALK_FORWARD_REPORT.md")
+    ap.add_argument("--status-json", default="data/walk_forward_status.json",
+                    help="Where to write the Dashboard's trust-badge status "
+                         "file (relative paths are resolved against ROOT).")
     args = ap.parse_args()
 
     wfc = WalkForwardConfig(
@@ -250,6 +255,21 @@ def main() -> int:
     report_path = Path(args.report)
     report_path.write_text("\n".join(sections))
     print(f"Wrote: {report_path}")
+
+    # ---- write the Dashboard trust-badge status file ----
+    status_payload = build_status_payload(
+        results=results, winners=winners, reasons=reasons,
+        wfc=wfc, joint=joint,
+    )
+    status_path = Path(args.status_json)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    import json
+    status_path.write_text(json.dumps(status_payload, indent=2))
+    n_changed = sum(1 for v in status_payload["verdicts"].values() if v["changed"])
+    n_total = len(status_payload["verdicts"])
+    print(f"Wrote: {status_path}  "
+          f"({n_total - n_changed}/{n_total} defaults kept OOS)")
+
     return 0
 
 

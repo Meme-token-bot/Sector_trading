@@ -293,10 +293,6 @@ def render_markdown(report: HeadlineReport,
     )
 
     # ---- MDD comparison line --------------------------------------------
-    # MDDs are negative numbers (e.g. -0.30 = -30% drawdown). Convention:
-    #   diff = strat - spy. Positive diff means strat is LESS negative =
-    #   SHALLOWER (good). Negative diff means strat is MORE negative =
-    #   DEEPER (bad). Previously had this inverted.
     diff_pp = (strat["max_drawdown"] - spy["max_drawdown"]) * 100.0
     if abs(diff_pp) < 2.0:
         mdd_obs = (
@@ -306,7 +302,6 @@ def render_markdown(report: HeadlineReport,
             f"the upside without buying meaningfully less drawdown.**"
         )
     elif diff_pp > 0:
-        # strat MDD less negative — shallower; this is the rotation-thesis win.
         mdd_obs = (
             f"The strategy MDD ({pct(strat['max_drawdown'], signed=True)}) is "
             f"**{diff_pp:.1f} pp shallower** than SPY's "
@@ -314,7 +309,6 @@ def render_markdown(report: HeadlineReport,
             f"part of the worst SPY drawdown in the window."
         )
     else:
-        # strat MDD more negative — deeper. Worst of both worlds.
         mdd_obs = (
             f"The strategy MDD ({pct(strat['max_drawdown'], signed=True)}) is "
             f"**{abs(diff_pp):.1f} pp DEEPER** than SPY's "
@@ -421,8 +415,75 @@ def render_markdown(report: HeadlineReport,
         for r, n in report.regime_distribution.items()
     )
 
+    # ---- Drawdown severity/duration caveat — computed, not hand-typed ----
+    # FIX (TRADING_EDGE_AUDIT.md item B5): this used to be a hardcoded
+    # sentence claiming "never tested in a true sustained -30%+ bear...
+    # drawdown evidence we have is from corrections (5-19% SPY moves), not
+    # crashes" — which directly contradicted the drawdown-attribution table
+    # two sections above whenever a fast crash (e.g. a -30%+ move that
+    # resolved in weeks, not years) was actually in the sample. The real
+    # distinction that matters for a rotation strategy is DEPTH *and*
+    # DURATION together: a fast VaR-shock crash and a grinding multi-year
+    # bear stress the model differently, and conflating "we haven't seen
+    # one" with "we haven't seen the other" is the bug. This now checks the
+    # actual `drawdown_attribution` output instead of asserting a number.
+    _LONG_BEAR_DAYS = 252  # ~1 trading year peak-to-trough — the line between
+                           # a fast shock and a grinding structural bear
+    if report.drawdown_attribution:
+        _worst = min(report.drawdown_attribution, key=lambda d: d["spy_drawdown"])
+        _max_dd = float(_worst["spy_drawdown"])
+        _max_dd_days = int(_worst["days_to_trough"])
+        _longest_days = max(int(d["days_to_trough"]) for d in report.drawdown_attribution)
+    else:
+        _worst, _max_dd, _max_dd_days, _longest_days = None, 0.0, 0, 0
+
+    if _worst is not None and _max_dd <= -0.30 and _longest_days < _LONG_BEAR_DAYS:
+        drawdown_caveat = (
+            f"**The window includes one fast, deep crash but no grinding "
+            f"multi-year bear.** The worst SPY drawdown captured is "
+            f"{pct(_max_dd, signed=True)} ({_worst['peak_date']} → "
+            f"{_worst['trough_date']}, {_max_dd_days} days peak-to-trough) — "
+            f"a genuine >30% shock, not a shallow correction, and the "
+            f"drawdown-attribution table above already scores how the "
+            f"strategy handled it. What the window has NOT captured is a "
+            f"sustained, grinding bear like 2000–02 or 2008 (12–24+ months "
+            f"peak-to-trough). A fast VaR-shock crash and a slow structural "
+            f"bear are different stress tests for a rotation strategy — only "
+            f"the former is in this sample."
+        )
+    elif _worst is not None and _max_dd <= -0.30:
+        drawdown_caveat = (
+            f"**The window includes a sustained, deep drawdown "
+            f"({_longest_days} days peak-to-trough).** Worst SPY move: "
+            f"{pct(_max_dd, signed=True)} ({_worst['peak_date']} → "
+            f"{_worst['trough_date']}). This is closer to the "
+            f"grinding-bear stress case than a fast shock — treat the "
+            f"strategy's behaviour here as more informative than a typical "
+            f"correction, though still a single episode."
+        )
+    else:
+        _worst_move_str = pct(_max_dd, signed=True) if _worst else "—"
+        _worst_days_str = f" ({_max_dd_days} days peak-to-trough)" if _worst else ""
+        drawdown_caveat = (
+            f"**The window has not seen a crash-scale (≥30%) SPY drawdown.** "
+            f"Worst move captured: {_worst_move_str}{_worst_days_str}. "
+            f"Treat the drawdown-attribution evidence above as coverage of "
+            f"corrections, not crashes — both fast shocks and grinding bears "
+            f"remain untested."
+        )
+
     # ---- Verdict paragraph (data-driven) --------------------------------
-    bull_excess = float(rs.loc["BULL", "excess_cum"]) if "BULL" in rs.index else 0.0
+    # FIX (TRADING_EDGE_AUDIT.md item B5): this used to quote
+    # `rs.loc["BULL", "excess_cum"]` — a CUMULATIVE compounding gap over the
+    # entire multi-year BULL-labelled window (e.g. "-127.23%"), which reads
+    # like an impossible "lost 127%" claim for a long-only, unlevered
+    # strategy. It's real math (strategy_cum - spy_cum, both already
+    # compounded), but the framing invites exactly that misreading. Swapped
+    # to the ANNUALIZED per-regime excess CAGR, which is already computed by
+    # `regime_conditional_stats` and is the number that's actually
+    # comparable to the headline `excess_cagr` figure quoted in the same
+    # sentence.
+    bull_excess_cagr = float(rs.loc["BULL", "excess_cagr"]) if "BULL" in rs.index else 0.0
     rotation_works = (dd_total > 0 and dd_wins / dd_total >= 0.6 and
                        dd_excess_sum / dd_total > 0)
     if rotation_works:
@@ -433,7 +494,7 @@ def render_markdown(report: HeadlineReport,
             f"{pct(dd_excess_sum/dd_total, signed=True)}. The headline "
             f"{pct(s['excess_cagr'], signed=True)} CAGR gap vs SPY is "
             f"**entirely explained by the BULL regime** — strategy gave up "
-            f"{pct(bull_excess, signed=True)} of upside there (up-capture "
+            f"{pct(bull_excess_cagr, signed=True)}/yr of upside there (up-capture "
             f"{rs.loc['BULL', 'capture_up']:.2f}, down-capture "
             f"{rs.loc['BULL', 'capture_down']:.2f}) — which is exactly what a "
             f"defensive rotation strategy is supposed to do."
@@ -718,6 +779,10 @@ CORRECTION = -5% to -15% from high; BEAR = below -15%. Window distribution:
 **How to read this:** up-capture (`Up-cap`) > 1 means the strategy outpaces
 SPY on up-days; down-capture (`Down-cap`) < 1 means the strategy loses less
 on down-days. The rotation thesis predicts down-capture < up-capture < 1.
+The `Excess` column above is CUMULATIVE (compounded gap over the whole
+regime's day count) — use the verdict paragraph below, which quotes the
+ANNUALIZED per-regime excess instead, for a number that's actually
+comparable to the headline excess CAGR.
 
 ---
 
@@ -738,11 +803,7 @@ LESS than SPY.
 
 **Caveats this measurement cannot escape:**
 
-1. **The window is short and bull-heavy.** The 2022 deep-bear bottomed
-   2022-10, which is essentially at the start of the backtest window (the
-   warmup eats the first ~1y of price history). The strategy has never been
-   tested in a true sustained −30%+ bear like 2008 or 2000–02. The drawdown
-   evidence we have is from corrections (5–19% SPY moves), not crashes.
+1. {drawdown_caveat}
 
 2. **The sentiment overlay's contribution is still unmeasured at scale.**
    n={on.get('n_signals', 0)} for the gated arm vs n={off.get('n_signals', 0)}
@@ -752,8 +813,8 @@ LESS than SPY.
    `signal_snapshots` table accumulates weekly; in a year we'll have an
    honest read.
 
-4. **5 of 5 drawdown wins is a small sample.** Drawdowns occur a few times
-   a year; this is 4 years of data. The pattern is consistent and the mean
+4. **{dd_total} drawdown episodes is still a small sample.** Drawdowns occur a few times
+   a year; this is a handful of years of data. The pattern is consistent and the mean
    lift is meaningful, but statistical significance requires more cycles.
 
 ### What would strengthen the evidence

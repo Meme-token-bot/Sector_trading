@@ -13,7 +13,7 @@ You execute trades manually via Tiger Brokers on Monday morning.
 
 ### The state legend (memorise this — it's everything)
 
-Every sector lands in one of six states each week. The dashboard tints
+Every sector lands in one of **seven** states each week. The dashboard tints
 rows by state across the matrix, the Tiger drift table, and the orders
 panel so the colour always means the same thing.
 
@@ -22,23 +22,39 @@ panel so the colour always means the same thing.
 | **NEW_BUY** | 🟢 green | Fresh BUY trigger this week — price above SMA200, beating SPY by 3M, sentiment ≥ +2 | Open a position |
 | **HOLD_IF_LONG** | 🟡 amber | Trend mature (≥ `stale_buy_weeks` of BUY in a row) | Keep if already held, but don't initiate |
 | **CHASE** | 🟠 orange | Price > SMA200 by more than `extension_pct_cutoff` (×β for expressions) | Skip — entry zone is gone |
-| **REDUCE** | 🟤 rust | Was BUY, now degraded (sentiment slipped, RS faded) | Trim |
-| **HOLD** | grey | Nothing convergent — no edge either way | Do nothing |
+| **REDUCE** | 🟤 rust | Was BUY, now degraded (sentiment slipped, RS faded), **or** a stale BUY facing a strong macro headwind | Trim |
+| **WATCH** | 🔭 teal | Not a BUY yet — price hasn't confirmed — but sentiment and the macro tape both support it (net macro tailwinds ≥ `macro_strong_count`) | No position — watch for the RS turn / SMA200 reclaim |
+| **HOLD** | grey | Nothing convergent — no edge either way, **or** a would-be fresh BUY that a strong macro headwind vetoed | Do nothing |
 | **SELL** | 🔴 red | Price < SMA200, OR bottom-3 RS rank, OR sentiment ≤ −3 | Exit |
 
 The orders panel only ever generates rows for **NEW_BUY** (BUY action)
 and **SELL / REDUCE** (sell action). CHASE and HOLD_IF_LONG are
-deliberately omitted — they're "do nothing this week."
+deliberately omitted — they're "do nothing this week." **WATCH** is a
+visibility flag, not a position — it never receives target-weight capital.
 
 ---
 
 ### 📈 Dashboard — the only tab you need to ship orders
 
-**Top: This Week's Orders.** One row per actionable trade. SELL rows
+**Top: Decision Cockpit.** Current SPY regime (BULL/CORRECTION/BEAR) and
+how many days it's held, cross-sectional breadth (how many of the 11 core
+sectors are above their own SMA200) and RS dispersion (how spread out
+relative strength is right now — low dispersion means sectors are moving
+together and rotation has less to work with), a rolling 12-week hit-rate
+read with a 95% confidence interval so a thin sample doesn't get mistaken
+for a real edge, and — once `scripts/run_walk_forward.py` has been run at
+least once — a one-line walk-forward trust badge showing whether current
+defaults are still the validated choice.
+
+**This Week's Orders.** One row per actionable trade. SELL rows
 fire only for sectors you currently hold (joined against the Tiger
 snapshot); BUY rows are sized as `target_weight × Tiger NLV`. The
 *Vehicle* column picks the top **CONFIRMED** expression ETF for the
-sector (falling back to the sector ETF itself). *Why* shows the
+sector (falling back to the sector ETF itself), and flags a ⚠ caution
+directly on the row if that vehicle is one of the handful with a
+documented thin-AUM / low-liquidity note in `config/expressions.py` (e.g.
+WQTM) — previously that caveat only lived in the Expressions tab, several
+clicks from where the actual trade decision gets made. *Why* shows the
 `state_reason` plus a 5-dot conviction badge. Empty state =
 "portfolio aligned, no actions this week."
 
@@ -55,16 +71,17 @@ UFO) sectors with the following columns:
 | **3M vs SPY** | Forward-looking edge — positive = sector is leading the index |
 | **Ext vs SMA** | How far above (or below) the 200-day moving average — large positive = stretched, large negative = broken |
 | **Wks BUY** | Consecutive weeks this sector has been BUY. ≥ `stale_buy_weeks` = trend is mature, expect HOLD_IF_LONG |
-| **Conviction** | 0–5 dot scale (●●●○○). +1 each for: RS>0, RS>strong margin, sentiment ≥ buy_threshold+1, ≥2 weeks BUY, macro tailwinds ≥ headwinds. Practical max is 4 when macro data is unavailable |
+| **Conviction** | 0–5 dot scale (●●●○○). +1 each for: RS>0, RS>strong margin, sentiment ≥ buy_threshold+1, ≥2 weeks BUY. The macro component is SYMMETRIC, not additive-only — a clear net tailwind adds a point, a clear net headwind SUBTRACTS one (floored at 0). A low score can mean either "nothing supports this" or "technicals are fine, macro is the drag" — the tooltip on this column spells out which |
 | **Sentiment** | `+2.1 · n=3 · σ=0.8` — mean newsletter score · how many newsletters covered this sector · stdev across them. High σ = newsletters disagree, take the mean with a grain of salt |
-| **State** | The six-state classification (see legend above), row-tinted |
-| **Macro** | `5/7 ✓` style pill = tailwind indicators / (tailwinds + headwinds). Neutral indicators excluded from the denominator. Green ≥ 0.625, amber 0.375–0.625, red < 0.375 |
+| **State** | The seven-state classification (see legend above), row-tinted |
+| **Macro** | `5/7 ✓` style pill = tailwind indicators / (tailwinds + headwinds). Neutral indicators excluded from the denominator, so denominators differ sector to sector — the color tint, not the raw fraction, is the fair comparison. Green ≥ 0.625, amber 0.375–0.625, red < 0.375 |
 | **Why** | For BUY-class rows: `📈 RS%  📊 Ext%  💬 Sentiment` triplet. For others: the prose `state_reason` |
 
 **Performance feedback strip.** Below the state-distribution counters:
-`NEW_BUY signals, last 12 weeks: hit rate X%, mean excess return +Y% vs SPY (n=Z)`.
-Tells you whether the model has been picking winners. Shows
-"Performance stats unavailable" when you have fewer than 4 weeks of
+`NEW_BUY signals, last 12 weeks: hit rate X% (95% CI L–H%), mean excess return +Y% vs SPY (n=Z)`.
+Tells you whether the model has been picking winners — and the confidence
+interval tells you how much to trust that number given the sample size.
+Shows "Performance stats unavailable" when you have fewer than 4 weeks of
 history.
 
 **Right pane: Tiger Drift.** Per-sector comparison of `target_weight`
@@ -119,8 +136,9 @@ For each sector, candidate expression ETFs from the curated whitelist
 in `config/expressions.py` (e.g. defence picks for XLI, biotech for
 XLV). Each row shows:
 
-- **Self-check state**: CONFIRMED / NEAR / WARMING_UP / BROKEN — the
-  expression's own technical posture, independent of the parent sector
+- **Self-check state**: CONFIRMED / LAGGING / STRETCHED / BROKEN /
+  WARMING_UP / PARENT_INACTIVE / NO_DATA — the expression's own
+  technical posture, independent of the parent sector
 - **Band**: `$28.40 → $34.12` — the BROKEN floor (SMA200) → the
   STRETCHED ceiling (SMA200 × (1 + cutoff% × β)). The healthy entry
   zone lives between these two prices
@@ -151,6 +169,15 @@ content)` — re-ingesting the same text is a no-op.
 Browse and (carefully) delete past newsletters. Deletion cascades to
 the per-sector ratings.
 
+### 🧪 Backtest — is the rotation thesis working
+
+Leads with the current regime badge, the rotation verdict (how many of
+the historical SPY drawdowns ≥5% the strategy lost less on), and
+up/down-capture ratios per regime — the metrics that actually matter for
+a defensive rotation strategy. The raw CAGR-vs-SPY comparison is demoted
+to an expander further down, since a rotation strategy giving up some
+bull-market upside is the expected trade-off, not a failure.
+
 ---
 
 ## Weekly workflow
@@ -158,7 +185,7 @@ the per-sector ratings.
 | When | Action |
 |---|---|
 | **Friday / Saturday** | Open **📧 Inbox** to auto-ingest newsletters as they arrive, or paste into **📥 Ingest Newsletter** for paywalled sources |
-| **Sunday** | Open **📈 Dashboard** → forces fresh price + sentiment compute. Skim the orders panel, the state-change strip, and the matrix. Open **📰 Weekly Recap** for narrative context |
+| **Sunday** | Open **📈 Dashboard** → forces fresh price + sentiment compute. Start with the Decision Cockpit (regime/breadth/rolling-edge), then skim the orders panel, the state-change strip, and the matrix. Open **📰 Weekly Recap** for narrative context |
 | **Monday morning** | Read the right-pane Tiger Drift table, place orders manually in the Tiger app. SELL rows first (sorted to the top), then BUY rows |
 
 ---
@@ -194,6 +221,8 @@ src/db.py                SQLite store for sentiment + persisted weekly recaps
 src/nlp_pipeline.py      Newsletter → NewsletterAnalysis → DB
 src/market_engine.py     yfinance prices, FRED yield curve, gold/oil
 src/macro_alignment.py   Per-sector macro tailwind / headwind scoring
+src/regime_snapshot.py   Regime + cross-sectional breadth/dispersion snapshot
+                         for the Dashboard's Decision Cockpit strip
 src/signals.py           Pure-function convergence decision matrix
 src/signal_history.py    Weekly snapshot history, state-change detection,
                          signal-vs-benchmark performance backtest
@@ -201,9 +230,12 @@ src/expression_signals.py Per-expression self-check (CONFIRMED / BROKEN / …)
 src/weekly_recap.py      Gather context + one-shot OpenAI synthesis
 src/tiger_client.py      Tiger positions + sector-aware drift
 app.py                   Streamlit dashboard
-scripts/                 CLI helpers (refresh, ingest)
+scripts/                 CLI helpers (refresh, ingest, walk-forward sweep)
 data/sentiment.db        SQLite (auto-created)
-tests/                   Pytest — 60+ tests, no network
+data/walk_forward_status.json  Last walk-forward sweep verdict, read by the
+                         Dashboard's trust badge (written by
+                         scripts/run_walk_forward.py)
+tests/                   Pytest — 70+ tests, no network
 ```
 
 ## Design notes
@@ -217,9 +249,10 @@ tests/                   Pytest — 60+ tests, no network
 - **Idempotency**: newsletters keyed by SHA256(content + author + date);
   Gmail messages also keyed by Gmail message ID.
 - **Pure signal logic**: `src/signals.py`, `src/macro_alignment.py`,
-  `src/signal_history.py`, `src/expression_signals.py` have no IO, no
-  globals, no caching. Same inputs always give same outputs —
-  preconditioned for backtesting and unit tests.
+  `src/signal_history.py`, `src/expression_signals.py`,
+  `src/regime_snapshot.py` have no IO, no globals, no caching. Same
+  inputs always give same outputs — preconditioned for backtesting and
+  unit tests.
 - **Lazy Tiger import**: `tigeropen` is imported inside functions only,
   so the dashboard runs without the SDK installed (Tiger panel and
   orders-panel sizing degrade gracefully).
@@ -229,10 +262,10 @@ tests/                   Pytest — 60+ tests, no network
   - Anything else is **HOLD**
 - **State classification** (refined signal — late-entry guard): the raw
   BUY / HOLD / SELL is then enriched with weekly history + extension
-  data into one of NEW_BUY / HOLD_IF_LONG / CHASE / REDUCE / HOLD /
-  SELL. Thresholds in `config/settings.py`
+  data into one of NEW_BUY / HOLD_IF_LONG / CHASE / REDUCE / WATCH /
+  HOLD / SELL. Thresholds in `config/settings.py`
   (`extension_pct_cutoff`, `stale_buy_weeks`, `history_weeks`,
-  `strong_rs_margin`).
+  `strong_rs_margin`, `macro_strong_count`).
 - **No leveraged ETFs**: the expression list is plain equity only.
   Operating leverage from underlying business cost structures, not
   derivatives.

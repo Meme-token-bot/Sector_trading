@@ -30,18 +30,6 @@ import pandas as pd
 
 from src.backtest import BacktestConfig, load_price_panel, run_backtest
 
-# ---------------------------------------------------------------------------
-# Configuration & candidate grids
-# ---------------------------------------------------------------------------
-
-# Each candidate is a fully-formed BacktestConfig override + a label. We keep
-# `chase_weight_fraction` and PARAMS overrides SEPARATE so the sweep can
-# touch both surfaces. PARAMS overrides go into `param_overrides` dict;
-# `chase_weight_fraction` is a BacktestConfig field.
-#
-# Grids are intentionally COARSE (5-ish candidates each) — the train window
-# is only ~2 years, so trying to discriminate between 0.18 and 0.19 is
-# noise. Coarse-then-fine is the right discipline.
 DEFAULT_GRIDS: dict[str, list[Any]] = {
     "extension_pct_cutoff":     [0.08, 0.12, 0.18, 0.25, 0.40],
     "weak_rs_rank_cutoff":      [0,    1,    2,    3,    4],
@@ -51,8 +39,6 @@ DEFAULT_GRIDS: dict[str, list[Any]] = {
     "cash_buffer":              [0.00, 0.02, 0.05, 0.10],
 }
 
-# Fields that live on BacktestConfig directly rather than on PARAMS — these
-# need different plumbing in `_make_config`.
 _CFG_FIELDS = {"chase_weight_fraction", "cash_buffer"}
 
 
@@ -61,8 +47,8 @@ class WalkForwardConfig:
     train_years: float = 2.0
     test_months: float = 6.0
     step_months: float = 6.0
-    metric: str = "excess_cagr"        # "excess_cagr" or "cagr" or "sharpe"
-    min_train_rebalances: int = 30     # skip degenerate folds
+    metric: str = "excess_cagr"
+    min_train_rebalances: int = 30
 
 
 @dataclass
@@ -73,11 +59,11 @@ class FoldResult:
     test_start: date
     test_end: date
     param: str
-    candidate_train_scores: dict[Any, float]   # candidate value -> train metric
-    winner: Any                                # candidate the optimizer would pick
-    winner_test_score: float                   # OOS score of the winner
-    default_test_score: float                  # OOS score of the live default
-    delta_vs_default: float                    # winner_test_score - default_test_score
+    candidate_train_scores: dict[Any, float]
+    winner: Any
+    winner_test_score: float
+    default_test_score: float
+    delta_vs_default: float
 
 
 @dataclass
@@ -86,28 +72,15 @@ class ParamSweepResult:
     candidates: list[Any]
     default_value: Any
     folds: list[FoldResult]
-    # Aggregations across folds:
-    winners_by_fold: list[Any]                 # what train picked, fold by fold
-    mean_winner_oos: float                     # mean OOS score when using train's pick
-    mean_default_oos: float                    # mean OOS score with default
-    mean_delta: float                          # winner - default, averaged
+    winners_by_fold: list[Any]
+    mean_winner_oos: float
+    mean_default_oos: float
+    mean_delta: float
     n_folds: int
 
 
-# ---------------------------------------------------------------------------
-# Fold scheduling
-# ---------------------------------------------------------------------------
-
 def build_folds(closes: pd.DataFrame, wfc: WalkForwardConfig
                 ) -> list[tuple[date, date, date, date]]:
-    """Generate (train_start, train_end, test_start, test_end) date tuples.
-
-    Anchored on the price panel's earliest tradeable date (NOT just the
-    panel's first row — the SMA200 + momentum warmup chews ~263 bars off
-    the front). We don't need to subtract that here because run_backtest
-    handles warmup internally; we just need to leave enough room for the
-    LAST fold's test window to fit before the panel ends.
-    """
     if closes.empty:
         return []
     first = closes.dropna(how="all").index[0].date()
@@ -129,13 +102,8 @@ def build_folds(closes: pd.DataFrame, wfc: WalkForwardConfig
     return folds
 
 
-# ---------------------------------------------------------------------------
-# Backtest helper — applies one candidate value to one window
-# ---------------------------------------------------------------------------
-
 def _make_config(param: str, value: Any, start: date, end: date,
                  base: BacktestConfig | None = None) -> BacktestConfig:
-    """Build a BacktestConfig that varies exactly one knob on top of `base`."""
     base = base or BacktestConfig()
     cfg = BacktestConfig(
         start=start, end=end,
@@ -168,20 +136,11 @@ def _score(stats: dict, metric: str) -> float:
 
 
 def _default_for(param: str) -> Any:
-    """The currently-shipped default for a tunable. Used as the comparison
-    point so the report can say "winner beat default by X" honestly. Reads
-    `chase_weight_fraction` from `PARAMS` (since the walk-forward sweep
-    promoted it from a backtest-only knob to a real `SignalParams` field);
-    `cash_buffer` stays at the 0.05 BacktestConfig default."""
     from config.settings import PARAMS
     if param == "cash_buffer":
         return 0.05
     return getattr(PARAMS, param)
 
-
-# ---------------------------------------------------------------------------
-# Main: 1D walk-forward sweep over one parameter
-# ---------------------------------------------------------------------------
 
 def sweep_1d(param: str,
              candidates: list[Any] | None = None,
@@ -191,13 +150,6 @@ def sweep_1d(param: str,
              opens: pd.DataFrame | None = None,
              on_progress: Callable[[str], None] | None = None,
              ) -> ParamSweepResult:
-    """Walk-forward sweep across one parameter.
-
-    For each fold, runs N backtests on the train window (one per candidate),
-    picks the best by `wfc.metric`, then runs ONE backtest on the test
-    window with that pick — out-of-sample. Default value is also scored on
-    the test window for honest comparison.
-    """
     wfc = wfc or WalkForwardConfig()
     candidates = list(candidates if candidates is not None
                        else DEFAULT_GRIDS[param])
@@ -220,27 +172,24 @@ def sweep_1d(param: str,
             cfg = _make_config(param, cand, tr_s, tr_e, base=base)
             try:
                 res = run_backtest(cfg, closes=closes, opens=opens)
-            except Exception:  # noqa: BLE001
-                # Skip combos that can't run (e.g. window too short for the
-                # warmup implied by an over-large momentum_window).
+            except Exception:
                 continue
             train_scores[cand] = _score(res.stats, wfc.metric)
         if not train_scores:
             continue
         winner = max(train_scores, key=train_scores.get)
 
-        # Score winner OOS:
         cfg_w = _make_config(param, winner, te_s, te_e, base=base)
         cfg_d = _make_config(param, default_value, te_s, te_e, base=base)
         try:
             w_oos = _score(run_backtest(cfg_w, closes=closes, opens=opens).stats,
                            wfc.metric)
-        except Exception:  # noqa: BLE001
+        except Exception:
             w_oos = float("nan")
         try:
             d_oos = _score(run_backtest(cfg_d, closes=closes, opens=opens).stats,
                            wfc.metric)
-        except Exception:  # noqa: BLE001
+        except Exception:
             d_oos = float("nan")
         fold_results.append(FoldResult(
             fold=i, train_start=tr_s, train_end=tr_e,
@@ -273,38 +222,18 @@ def sweep_1d(param: str,
     )
 
 
-# ---------------------------------------------------------------------------
-# Pick a "robust" winner from a ParamSweepResult
-# ---------------------------------------------------------------------------
-
 def pick_robust_winner(result: ParamSweepResult) -> tuple[Any, str]:
-    """Choose a single value per parameter using a robustness rule.
-
-    Rules, in order:
-      1. If the train optimizer's per-fold winners don't beat the default
-         OUT-OF-SAMPLE on average by at least +0.5pp, KEEP THE DEFAULT.
-         A negative mean delta means the optimizer is overfitting the
-         train window; applying its picks live would lose money. A near-
-         zero delta isn't worth churning a live parameter for.
-      2. Otherwise, choose the MODAL winner across folds (the value the
-         optimizer picked most often). Ties broken by per-candidate
-         mean OOS score across folds (not just train score).
-
-    Returns (winner_value, justification_string).
-    """
     from collections import Counter
     counts = Counter(result.winners_by_fold)
     if not counts:
         return result.default_value, "no folds — keep default"
 
-    # Rule 1: train optimizer must actually earn its keep OOS.
     if np.isnan(result.mean_delta) or result.mean_delta <= 0.005:
         sign = "negative" if result.mean_delta < 0 else "≤0.5pp"
         return result.default_value, (
             f"train picks lifted OOS by {result.mean_delta*100:+.2f}pp "
             f"({sign}) — keep default")
 
-    # Rule 2: modal pick across folds, OOS-tiebreak.
     max_n = max(counts.values())
     modes = [v for v, n in counts.items() if n == max_n]
     if len(modes) > 1:
@@ -325,3 +254,68 @@ def pick_robust_winner(result: ParamSweepResult) -> tuple[Any, str]:
     return winner, (
         f"modal pick across {result.n_folds} folds ({max_n}/{result.n_folds}); "
         f"mean OOS lift {result.mean_delta*100:+.2f}pp")
+
+
+# ---------------------------------------------------------------------------
+# Status payload for the Dashboard's walk-forward trust badge
+# (TRADING_EDGE_AUDIT.md item B3 — write side. Read side is
+# app.py::_cached_walk_forward_verdict, which reads the JSON this produces.)
+# ---------------------------------------------------------------------------
+
+def build_status_payload(
+    results: dict[str, ParamSweepResult],
+    winners: dict[str, Any],
+    reasons: dict[str, str],
+    wfc: WalkForwardConfig,
+    joint: dict | None = None,
+    generated_at: date | None = None,
+) -> dict:
+    """Assemble the small JSON status object the Dashboard reads.
+
+    Pure function — deliberately separated from `scripts/run_walk_forward.py`
+    so the payload shape is unit-testable without running a real sweep
+    (network/price-DB access). The CLI script's only remaining job is to
+    call this and write the result to `data/walk_forward_status.json`.
+
+    Schema (kept intentionally small — the Dashboard only ever renders a
+    one-line trust badge from this, not the full sweep table; the full
+    per-fold detail stays in the generated WALK_FORWARD_REPORT.md):
+
+    {
+      "generated_at": "YYYY-MM-DD",
+      "schedule": "train Xy / test Ymo / step Zmo, metric=...",
+      "verdicts": {
+        param: {
+          "winner": ..., "default": ..., "why": str,
+          "mean_delta": float, "changed": bool,
+        }, ...
+      },
+      "joint": {"mean_default_excess": ..., "mean_new_excess": ...,
+                "mean_delta_excess": ...} | None,
+    }
+    """
+    generated_at = generated_at or date.today()
+    verdicts: dict[str, dict] = {}
+    for param, result in results.items():
+        winner = winners.get(param, result.default_value)
+        verdicts[param] = {
+            "winner": winner,
+            "default": result.default_value,
+            "why": reasons.get(param, ""),
+            "mean_delta": (None if np.isnan(result.mean_delta)
+                          else round(float(result.mean_delta), 5)),
+            "changed": bool(winner != result.default_value),
+        }
+    payload = {
+        "generated_at": generated_at.isoformat(),
+        "schedule": (f"train {wfc.train_years}y / test {wfc.test_months}mo / "
+                    f"step {wfc.step_months}mo, metric={wfc.metric}"),
+        "verdicts": verdicts,
+    }
+    if joint:
+        payload["joint"] = {
+            "mean_default_excess": joint.get("mean_default_excess"),
+            "mean_new_excess": joint.get("mean_new_excess"),
+            "mean_delta_excess": joint.get("mean_delta_excess"),
+        }
+    return payload

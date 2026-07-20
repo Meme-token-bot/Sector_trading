@@ -267,6 +267,49 @@ def _cached_signal_performance(as_of_iso: str) -> dict:
         history, price_map, benchmark_ticker=BENCHMARK, weeks=12,
     )
 
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_rolling_performance(as_of_iso: str) -> pd.DataFrame:
+    from src.signal_history import rolling_signal_performance
+    prices = _cached_prices()
+    price_map = {c: prices[c].dropna() for c in prices.columns}
+    return rolling_signal_performance(price_map, benchmark_ticker=BENCHMARK,
+                                      window_weeks=12, step_weeks=1)
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_conviction_calibration(as_of_iso: str) -> pd.DataFrame:
+    from src.signal_history import performance_by_conviction
+    prices = _cached_prices()
+    price_map = {c: prices[c].dropna() for c in prices.columns}
+    return performance_by_conviction(price_map, benchmark_ticker=BENCHMARK, weeks=52)
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_information_coefficient(as_of_iso: str) -> pd.DataFrame:
+    from src.db import load_signal_snapshots
+    from src.edge_metrics import information_coefficient
+    prices = _cached_prices()
+    price_map = {c: prices[c].dropna() for c in prices.columns}
+    return information_coefficient(load_signal_snapshots(), price_map, score_col="conviction")
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_risk_snapshot(as_of_iso: str) -> dict:
+    from src.risk_metrics import (compute_correlation_matrix, average_pairwise_correlation,
+        concentration_metrics, historical_var_es, annualized_vol_by_ticker)
+    prices = _cached_prices()
+    metrics_l = compute_sector_metrics(prices)
+    raw_l = build_signals(metrics_l, _cached_sentiment(as_of_iso))
+    signals_l = refine_signals(raw_l, _cached_signal_history(as_of_iso),
+                               macro_alignment=_cached_macro_alignment_frame())
+    targets_l = target_weights(signals_l)
+    names = list(targets_l.index)
+    corr = compute_correlation_matrix(prices, names, lookback_weeks=52)
+    vols = annualized_vol_by_ticker(prices, names, lookback_weeks=52)
+    conc = concentration_metrics(targets_l, corr=corr if not corr.empty else None,
+                                 vols=vols if not vols.empty else None)
+    var_es = historical_var_es(prices, targets_l, lookback_weeks=104, confidence=0.95)
+    return {"n_names": len(names), "avg_corr": average_pairwise_correlation(corr),
+           "eff_n_naive": conc["effective_n_naive"], "eff_n_corr": conc["effective_n_corr_adjusted"],
+           "var": var_es["var"], "es": var_es["es"], "corr_matrix": corr}
+
 
 def _signal_row_style(row: pd.Series) -> list[str]:
     state = row.get("State", row.get("state", row.get("Signal", row.get("signal", ""))))
@@ -692,6 +735,41 @@ with tab_dashboard:
                        f"{_kept}/{_total} defaults kept OOS</div>", unsafe_allow_html=True)
     st.divider()
 
+    with st.expander("⚠️ Portfolio Risk — correlation, concentration, VaR", expanded=False):
+            _risk = _cached_risk_snapshot(today_iso)
+            if _risk["n_names"] < 2:
+                st.caption("Fewer than 2 target-weight sectors this week — nothing to correlate.")
+            else:
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                rc1.metric("Avg pairwise corr", f"{_risk['avg_corr']:.2f}" if pd.notna(_risk['avg_corr']) else "—")
+                _en = _risk['eff_n_corr']
+                rc2.metric("Effective # bets", f"{_en:.1f} of {_risk['eff_n_naive']:.0f}" if _en else f"{_risk['eff_n_naive']:.1f}")
+                rc3.metric("Weekly VaR (95%)", f"{_risk['var']*100:+.1f}%" if pd.notna(_risk['var']) else "—")
+                rc4.metric("Weekly ES (95%)", f"{_risk['es']*100:+.1f}%" if pd.notna(_risk['es']) else "—")
+                if not _risk["corr_matrix"].empty:
+                    st.dataframe(_risk["corr_matrix"].style.background_gradient(
+                        cmap="RdYlGn_r", vmin=-1, vmax=1).format("{:.2f}"), use_container_width=True)
+                st.caption("Computed on this week's TARGET weights, not necessarily current Tiger holdings "
+                          "(see the drift table for that). VaR/ES are empirical/historical, 1-week horizon. "
+                          "'Effective # bets' uses a diversification-ratio heuristic, not full PCA — see "
+                          "src/risk_metrics.py for exactly what it does and doesn't capture.")
+
+    with st.expander("✅ Pre-Trade Checklist", expanded=False):
+            from src.preflight_checks import check_data_freshness, check_tiger, list_monday_orders, overall_verdict
+            _pf_rows = check_data_freshness()
+            _model_state = {"signals": signals, "targets": targets, "current_regime": _rb["regime"] if _rb else "—"}
+            _snap_for_checklist = _cached_tiger_snapshot() if tiger_configured() else None
+            _tiger_rows = check_tiger(_model_state, snapshot=_snap_for_checklist)
+            _order_summary, _ = list_monday_orders(_model_state)
+            _pf_rows += _tiger_rows + _order_summary
+            _v = overall_verdict(_pf_rows)
+            _badge = {"ready": "🟢 READY", "ready_with_warnings": "🟡 READY WITH WARNINGS",
+                     "not_ready": "🔴 NOT READY"}[_v["verdict"]]
+            st.markdown(f"**{_badge}** — {_v['n_ok']} ok, {_v['n_warn']} warn, {_v['n_fail']} fail")
+            for r in _pf_rows:
+                _icon = {"OK": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(r["status"], "·")
+                st.markdown(f"{_icon} **{r['label']}** — {r['detail']}")
+
     left, right = st.columns([3, 2], gap="large")
 
     with left:
@@ -988,6 +1066,45 @@ with tab_dashboard:
                 f"hit rate {perf['hit_rate']*100:.0f}% (95% CI {_lo_p*100:.0f}–{_hi_p*100:.0f}%), "
                 f"mean excess return {perf['mean_excess_return']*100:+.1f}% vs {BENCHMARK} (n={perf['n_signals']})"
             )
+
+    with st.expander("📉 Rolling edge trend", expanded=False):
+        _rdf = _cached_rolling_performance(today_iso)
+        if _rdf.empty:
+            st.caption("Not enough signal_snapshots history yet — fills in as weekly snapshots accumulate.")
+        else:
+            import plotly.graph_objects as go
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(_rdf.index) + list(_rdf.index[::-1]),
+                y=list(_rdf["ci_hi"]) + list(_rdf["ci_lo"][::-1]),
+                fill="toself", fillcolor="rgba(46,204,113,0.15)",
+                line=dict(width=0), showlegend=False, hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=_rdf.index, y=_rdf["hit_rate"], mode="lines+markers",
+                name="Hit rate", line=dict(color="#2ecc71", width=2),
+                hovertemplate="%{x|%Y-%m-%d}<br>hit rate %{y:.0%}<extra></extra>"))
+            fig.add_hline(y=0.5, line=dict(color="rgba(255,255,255,0.3)", dash="dot"))
+            fig.update_layout(template="plotly_dark", height=240, margin=dict(l=10,r=10,t=20,b=10),
+                yaxis=dict(tickformat=".0%", range=[0,1]), paper_bgcolor="#0e1117", plot_bgcolor="#11161d")
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Shaded band = 95% Wilson CI on the trailing 12-week hit rate at each point — "
+                        "a wide band means that week's read is a thin sample, not a strong signal.")
+
+    with st.expander("🎯 Conviction calibration", expanded=False):
+        _cdf = _cached_conviction_calibration(today_iso)
+        if _cdf.empty:
+            st.caption("Not enough signal_snapshots history yet.")
+        else:
+            _show = _cdf.copy()
+            _show["Conviction"] = _show.index.map(_format_conviction)
+            _show["Hit rate (95% CI)"] = _show.apply(
+                lambda r: f"{r['hit_rate']*100:.0f}% ({r['ci_lo']*100:.0f}\u2013{r['ci_hi']*100:.0f}%)", axis=1)
+            _show["Mean excess"] = _show["mean_excess_return"].map(lambda x: f"{x*100:+.1f}%")
+            _show["n"] = _show["n_signals"].astype(int)
+            st.dataframe(_show[["Conviction", "n", "Hit rate (95% CI)", "Mean excess"]],
+                        use_container_width=True, hide_index=True)
+            st.caption("If higher-conviction rows don't show a meaningfully better hit rate/excess, "
+                        "or the CIs overlap heavily, the dot score isn't yet earning its keep as a "
+                        "ranking signal — treat it as a rough prior, not a precise dial.")
 
         _has_buy_signals = not targets.empty
         _chase_pct = PARAMS.chase_weight_fraction * 100
@@ -3204,6 +3321,18 @@ with tab_backtest:
                 ),
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    with st.expander("📐 Signal quality — information coefficient by horizon", expanded=False):
+        _ic_df = _cached_information_coefficient(date.today().isoformat())
+        if _ic_df.empty:
+            st.caption("Not enough signal_snapshots history yet to compute IC.")
+        else:
+            st.dataframe(_ic_df.style.format({"mean_ic": "{:+.3f}", "ic_std": "{:.3f}", "t_stat": "{:+.2f}"}),
+                        use_container_width=True)
+            st.caption("mean_ic = mean cross-sectional Spearman rank correlation between conviction and "
+                      "forward return at that horizon, averaged across weekly periods. n_periods matters "
+                      "most right now — with only a handful of independent weeks, treat this as "
+                      "directional, not conclusive.")
 
     # ---- 10. Trade log download ----------------------------------------
     if out["trades_csv"]:
