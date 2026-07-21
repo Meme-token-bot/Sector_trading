@@ -695,7 +695,9 @@ with tab_dashboard:
         except Exception:  # noqa: BLE001
             # A persistence hiccup must NEVER break the dashboard render.
             pass
-
+    
+    today_iso = date.today().isoformat()
+    
     section("Decision Cockpit", level=3)
     try:
         _rb = _cached_regime_and_breadth(date.today().isoformat())
@@ -775,8 +777,6 @@ with tab_dashboard:
     with left:
         # ====== 1. This Week's Orders =====================================
         section("This Week's Orders", level=3)
-
-        today_iso = date.today().isoformat()
 
         # Establish currently-held sectors from Tiger when available, so SELL
         # rows only fire for things we actually own.  When Tiger is absent,
