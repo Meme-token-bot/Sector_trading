@@ -78,3 +78,19 @@ def bollinger(close: pd.Series, period: int = 20,
         "upper": mid + num_std * std,
         "lower": mid - num_std * std,
     }, index=close.index)
+
+def atr(ohlcv: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average True Range, Wilder-smoothed (EMA alpha=1/period) -- matches
+    the Wilder convention already used by rsi() above. Requires an OHLCV
+    frame with high/low/close columns (unlike the other functions in this
+    file, which take a bare Close series)."""
+    if period <= 0:
+        raise ValueError("period must be positive")
+    high, low, close = ohlcv["high"], ohlcv["low"], ohlcv["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()

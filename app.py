@@ -7,7 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from config.settings import (
-    BENCHMARK, GMAIL_ADDRESS, GMAIL_FILTER_ADDRESS, PARAMS,
+    BENCHMARK, BREAKOUT, GMAIL_ADDRESS, GMAIL_FILTER_ADDRESS, PARAMS,
     SECTOR_ETFS, SUPPLEMENTARY_SECTORS, gmail_configured, tiger_configured,
 )
 from src.charts import STATE_COLORS as _STATE_COLORS, build_etf_chart, build_mini_chart, compute_chart_overlays
@@ -38,9 +38,13 @@ init_db()
 
 def _full_price_universe() -> list[str]:
     """Tickers seeded into the OHLCV cache: signals + benchmark + all
-    expression tickers, deduped while preserving signal-first order."""
+    expression tickers + the expanded (metals/crypto) universe, deduped
+    while preserving signal-first order."""
     from config.expressions import all_expression_tickers
-    return list(dict.fromkeys([*SECTOR_ETFS, BENCHMARK, *all_expression_tickers()]))
+    from config.expanded_universe import all_expanded_tickers
+    return list(dict.fromkeys([
+        *SECTOR_ETFS, BENCHMARK, *all_expression_tickers(), *all_expanded_tickers(),
+    ]))
 
 
 def _render_update_price_data_button(
@@ -667,10 +671,10 @@ render_header(
 )
 
 (tab_dashboard, tab_recap, tab_macro, tab_price, tab_expressions, tab_trend,
- tab_inbox, tab_ingest, tab_history, tab_backtest) = st.tabs(
+ tab_inbox, tab_ingest, tab_history, tab_backtest, tab_breakouts) = st.tabs(
     ["📈 Dashboard", "📰 Weekly Recap", "🌐 Macro", "📉 Price Action",
      "🎯 Expressions", "✨ Trend", "📧 Inbox", "📥 Ingest Newsletter",
-     "🗂 History", "🧪 Backtest"]
+     "🗂 History", "🧪 Backtest", "🚀 Breakouts"]
 )
 
 with tab_dashboard:
@@ -2314,6 +2318,39 @@ def _cached_expression_signals(
     ]
 
 @st.cache_data(ttl=300, show_spinner=False)
+def _cached_breakout_universe(as_of_iso: str) -> list[dict]:
+    """Breakout/money-flow signal for every ticker in the expanded universe.
+    Returns plain dicts (not the dataclass) for the same reason
+    _cached_expression_signals does -- streamlit's cache and frozen
+    dataclasses with nested dataclass fields don't always pickle cleanly.
+    """
+    from config.expanded_universe import EXPANDED_UNIVERSE
+    from src.breakout_signals import compute_breakout_signal
+    from src.price_store import load_ohlcv
+
+    warmup_start = date.fromisoformat(as_of_iso) - timedelta(days=BREAKOUT.atr_baseline_period + 400)
+    out: list[dict] = []
+    for group, instruments in EXPANDED_UNIVERSE.items():
+        for inst in instruments:
+            df = load_ohlcv(inst.ticker, "1d", start=warmup_start)
+            sig = compute_breakout_signal(inst.ticker, df)
+            out.append({
+                "group": group, "ticker": inst.ticker, "label": inst.label,
+                "asset_class": inst.asset_class,
+                "execution_ticker": inst.execution_ticker or inst.ticker,
+                "execution_route": inst.execution_route,
+                "is_primary": inst.is_primary,
+                "signal": sig.signal, "conviction": sig.conviction,
+                "reasons": sig.signal_reasons, "risk_flags": sig.risk_flags,
+                "price": sig.price, "sma_50": sig.sma_50, "sma_150": sig.sma_150,
+                "sma_50_state": sig.sma_50_slope_state, "sma_150_state": sig.sma_150_slope_state,
+                "money_flow_state": sig.money_flow_state, "cmf": sig.cmf,
+                "consolidation_days": sig.consolidation.consolidation_days,
+                "breakout": sig.consolidation.breakout,
+            })
+    return out
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _cached_signals_bundle(as_of_iso: str) -> pd.DataFrame:
     """Re-compute the same signals bundle the Dashboard tab uses. Cached so
     repeated Price Action reruns (toggling indicators, switching tickers) don't
@@ -3351,3 +3388,95 @@ with tab_backtest:
         f"CHASE sleeve, 5% cash buffer. See `BACKTEST_REPORT.md` for the "
         f"full methodology and caveats."
     )
+
+_SIGNAL_BADGE = {
+    "HIGH_CONVICTION_BUY": ("🟢", "#2ecc71"), "BUY": ("🟢", "#6cc78a"),
+    "WATCH": ("🔭", "#3aa6c4"), "NO_SIGNAL": ("⚪", "#888888"),
+    "RISK_EXIT": ("🔴", "#e74c3c"), "NOT_ENOUGH_DATA": ("⚫", "#555555"),
+}
+_ROUTE_BADGE = {
+    "BROKERAGE_TICKER": "🏦 Brokerage Ticker",
+    "DIRECT_SPOT_WALLET": "🔑 Direct Spot Wallet",
+}
+
+with tab_breakouts:
+    section(
+        "Breakout Scanner — consolidation, trend & money-flow signal",
+        help=(
+            "Independent of the sentiment-gated sector model above -- these "
+            "signals are price/volume only (no newsletter coverage exists "
+            "for this universe). NOT_ENOUGH_DATA means exactly that, not "
+            "'no signal'. CMF/OBV are ACCUMULATION/DISTRIBUTION proxies, "
+            "not evidence of institutional activity specifically."
+        ),
+    )
+    rows = _cached_breakout_universe(date.today().isoformat())
+    if not rows:
+        st.info("No expanded-universe price history yet — click 🔄 Update "
+                 "price data on the Price Action tab.")
+    else:
+        rdf = pd.DataFrame(rows)
+
+        import plotly.express as px
+        heat_score = {
+            "money_flow": rdf["money_flow_state"].map({
+                "Strong Accumulation": 2, "Accumulation": 1, "Neutral": 0,
+                "Distribution": -1, "Strong Distribution": -2}).fillna(0),
+            "trend_regime": rdf.apply(
+                lambda r: (2 if (r["sma_150_state"] == "Rising" and r["price"] and r["sma_150"]
+                                 and r["price"] > r["sma_150"])
+                           else -2 if r["sma_150_state"] == "Falling" else 0), axis=1),
+            "conviction": rdf["conviction"] - 2.5,
+        }
+        heat = pd.DataFrame(heat_score, index=rdf["ticker"]).T
+        fig = px.imshow(heat, color_continuous_scale="RdYlGn", zmin=-2.5, zmax=2.5,
+                        aspect="auto", labels={"color": "Score"})
+        fig.update_layout(height=260, margin=dict(l=4, r=4, t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+        for group, grp in rdf.groupby("group", sort=False):
+            with st.expander(f"{group}", expanded=(grp["signal"].isin(
+                    ["BUY", "HIGH_CONVICTION_BUY", "RISK_EXIT"]).any())):
+                for _, r in grp.iterrows():
+                    emoji, color = _SIGNAL_BADGE.get(r["signal"], ("⚪", "#888"))
+                    route_label = _ROUTE_BADGE.get(r["execution_route"], r["execution_route"])
+                    st.markdown(
+                        f"<div style='border-left:4px solid {color}; padding:6px 12px; margin-bottom:8px;'>"
+                        f"<b>{emoji} {r['ticker']}</b> — {r['label']} "
+                        f"&nbsp;<span style='color:{color}; font-weight:600'>{r['signal']}</span>"
+                        f"<br><span style='font-size:0.85em; color:#aaa;'>Execution: "
+                        f"<b>{route_label}</b> → <code>{r['execution_ticker']}</code></span>"
+                        f"<br><span style='font-size:0.85em;'>{' · '.join(r['reasons'][:3])}</span>"
+                        + (f"<br><span style='font-size:0.85em; color:#e67e22;'>⚠ "
+                           f"{' · '.join(r['risk_flags'])}</span>" if r["risk_flags"] else "")
+                        + "</div>", unsafe_allow_html=True,
+                    )
+
+        with st.expander("📊 Backtest this signal (weekly, ~30s on the full universe)", expanded=False):
+            if st.button("Run backtest", key="breakout_bt_run"):
+                from src.breakout_backtest import run_breakout_backtest, BreakoutBacktestConfig
+                from config.expanded_universe import EXPANDED_UNIVERSE
+                from src.price_store import load_ohlcv
+
+                with st.spinner("Running breakout backtest…"):
+                    universe = {}
+                    for grp2 in EXPANDED_UNIVERSE.values():
+                        for inst in grp2:
+                            df = load_ohlcv(inst.ticker, "1d")
+                            if not df.empty:
+                                universe[inst.ticker] = df
+                    spy = load_ohlcv(BENCHMARK, "1d")["close"]
+                    res = run_breakout_backtest(universe, spy, BreakoutBacktestConfig())
+
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("CAGR", f"{res.stats['cagr']*100:+.1f}%")
+                c2.metric("vs SPY", f"{res.stats['excess_cagr']*100:+.1f}%")
+                c3.metric("Max drawdown", f"{res.stats['max_drawdown']*100:+.1f}%")
+                c4.metric("Trades", res.stats['n_trades'])
+                eq_df = pd.DataFrame({"Strategy": res.equity, "SPY": res.benchmark_equity})
+                st.line_chart(eq_df, height=280)
+                st.caption(
+                    "Weekly-marked equity, 5bps/side costs, equal-weight across up to "
+                    "8 BUY-class names. Signal-validation harness, not a production "
+                    "simulator -- see src/breakout_backtest.py docstring."
+                )

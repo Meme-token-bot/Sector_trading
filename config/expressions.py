@@ -22,6 +22,12 @@ class Expression:
     beta_hint: float   # rough 3M price beta vs the signal ETF
     note: str = ""
 
+    # Execution routing. Defaults keep every existing Expression(...) call
+    # in this file valid unchanged — analysis and execution are the same
+    # ticker via the standard route unless explicitly overridden.
+    execution_ticker: str = ""       # "" => same as `ticker`
+    execution_route: str = "BROKERAGE_TICKER"   # or "DIRECT_SPOT_WALLET"
+
 
 EXPRESSIONS: dict[str, list[Expression]] = {
     "XLK": [
@@ -161,6 +167,29 @@ EXPRESSIONS: dict[str, list[Expression]] = {
     ],
 }
 
+# ---------------------------------------------------------------------------
+# iShares alternates for the 11 core sectors. Additive-merge pattern rather
+# than editing each EXPRESSIONS[sector] list literal in place — one block
+# instead of 11 scattered edits. Flows automatically into price updates
+# (all_expression_tickers() below), sparklines, and the Expressions tab
+# self-check exactly like every other entry — these are judged the SAME
+# way VGT/VOX/VDC already are (relative to their parent sector's state).
+# ---------------------------------------------------------------------------
+_ISHARES_ALTERNATES: dict[str, Expression] = {
+    "XLK":  Expression("IYW", "iShares U.S. Technology",              "plain", 1.00),
+    "XLV":  Expression("IYH", "iShares U.S. Healthcare",               "plain", 1.00),
+    "XLF":  Expression("IYF", "iShares U.S. Financials",                "plain", 1.00),
+    "XLY":  Expression("IYC", "iShares U.S. Consumer Discretionary",   "plain", 1.00),
+    "XLC":  Expression("IXP", "iShares Global Comm Services",          "plain", 1.00),
+    "XLI":  Expression("IYJ", "iShares U.S. Industrials",               "plain", 1.00),
+    "XLP":  Expression("IYK", "iShares U.S. Consumer Staples",         "plain", 1.00),
+    "XLE":  Expression("IYE", "iShares U.S. Energy",                    "plain", 1.00),
+    "XLU":  Expression("IDU", "iShares U.S. Utilities",                 "plain", 1.00),
+    "XLRE": Expression("IYR", "iShares U.S. Real Estate",               "plain", 1.00),
+    "XLB":  Expression("IYM", "iShares U.S. Basic Materials",          "plain", 1.00),
+}
+for _sector, _expr in _ISHARES_ALTERNATES.items():
+    EXPRESSIONS.setdefault(_sector, []).append(_expr)
 
 def all_expression_tickers() -> list[str]:
     """Flat list of every expression ticker across all sectors."""

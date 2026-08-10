@@ -159,3 +159,40 @@ class ExpressionParams:
     theme_news_max_age_days: int = 14
 
 EXPRESSION = ExpressionParams()
+
+# --- Breakout / consolidation / money-flow signal (independent of PARAMS
+# above — this system is deliberately NOT sentiment-gated; see
+# src/breakout_signals.py module docstring for why). ---------------------
+@dataclass(frozen=True)
+class BreakoutParams:
+    sma_short: int = 50
+    sma_long: int = 150
+    slope_lookback: int = 10                  # trading days, for Rising/Flat/Falling
+    slope_deadband_pct_per_day: float = 0.0005
+    consolidation_min_days: int = 60          # ~3 months, per spec
+    breakout_lookback_days: int = 10          # how long a breakout stays "active"
+    atr_period: int = 14
+    atr_baseline_period: int = 252
+    atr_compression_threshold: float = 0.75   # current ATR% <= 75% of its own 1y avg
+    bb_period: int = 20
+    bb_lookback: int = 252
+    bbw_percentile_threshold: float = 0.25    # bottom quartile of its own 1y BBW history
+    compression_require: str = "either"       # "atr" | "bbw" | "either" | "both"
+    cmf_period: int = 20
+    obv_period: int = 14
+    obv_vol_norm_period: int = 63
+
+BREAKOUT = BreakoutParams()
+
+
+@dataclass(frozen=True)
+class MoneyFlowThresholds:
+    """Configurable classification bands -- documented starting priors, not
+    fitted. Recalibrate once signal_snapshots-style forward history exists,
+    same caveat this codebase already applies to macro/dispersion bands."""
+    cmf_strong: float = 0.15
+    cmf_mild: float = 0.05
+    obv_slope_strong: float = 0.15
+    obv_slope_mild: float = 0.05
+
+MONEY_FLOW = MoneyFlowThresholds()
