@@ -2330,6 +2330,27 @@ def _cached_breakout_universe(as_of_iso: str) -> list[dict]:
 
     warmup_start = date.fromisoformat(as_of_iso) - timedelta(days=BREAKOUT.atr_baseline_period + 400)
     out: list[dict] = []
+    from config.expressions import EXPRESSIONS
+    from config.settings import SECTOR_ETFS
+    for sector, name in SECTOR_ETFS.items():
+        plain_tickers = [e for e in EXPRESSIONS.get(sector, []) if e.kind == "plain"]
+        for e in plain_tickers:
+            df = load_ohlcv(e.ticker, "1d", start=warmup_start)
+            sig = compute_breakout_signal(e.ticker, df)
+            out.append({
+                "group": f"{name} ({sector})", "ticker": e.ticker, "label": e.label,
+                "asset_class": "Equity Sector",
+                "execution_ticker": e.execution_ticker or e.ticker,
+                "execution_route": e.execution_route,
+                "is_primary": (e.ticker == sector),
+                "signal": sig.signal, "conviction": sig.conviction,
+                "reasons": sig.signal_reasons, "risk_flags": sig.risk_flags,
+                "price": sig.price, "sma_50": sig.sma_50, "sma_150": sig.sma_150,
+                "sma_50_state": sig.sma_50_slope_state, "sma_150_state": sig.sma_150_slope_state,
+                "money_flow_state": sig.money_flow_state, "cmf": sig.cmf,
+                "consolidation_days": sig.consolidation.consolidation_days,
+                "breakout": sig.consolidation.breakout,
+            })
     for group, instruments in EXPANDED_UNIVERSE.items():
         for inst in instruments:
             df = load_ohlcv(inst.ticker, "1d", start=warmup_start)
