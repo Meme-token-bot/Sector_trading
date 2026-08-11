@@ -527,4 +527,72 @@ CLI, to keep the Breakouts universe fresh via cron.
 > tight 74-day consolidation, broke out 3 days ago, SMA50 rising.
 > Risk flags: "Price $41.20 is below SMA150 ($44.80)".
 
-**Reading:** the short-term setup (consolidation + breakout + rising SMA50) is real — but the ticker is still in a longer-term downtrend (price below a falling or barely-rising SMA150), and that overrides everything else. This is deliberate: a clean short-
+**Reading:** the short-term setup (consolidation + breakout + rising SMA50) is real — but the ticker is still in a longer-term downtrend (price below a falling or barely-rising SMA150), and that overrides everything else. This is deliberate: a clean short-term breakout inside a longer-term downtrend is exactly the kind of setup that traps momentum traders — the RISK_EXIT label forces you to see the longer-term context before the breakout alone gets you excited. If SMA150 later turns from Falling to Rising with price back above it, the same setup would re-evaluate to BUY or HIGH_CONVICTION_BUY on its own; nothing here is a permanent block.
+
+---
+
+## 4. Operational notes
+
+- **Caches.** Most expensive computations are cached for 5 minutes to several hours (see `@st.cache_data(ttl=...)` decorators in `app.py`) — prices 6h, Tiger snapshot 5min, sentiment aggregate 10min, weekly recap 12h in-memory + permanent on disk, most everything else in between. The `🔄 Force refresh all caches` button at the bottom of the Dashboard clears everything.
+- **Update cadence.** The convergence test is designed for **weekly** decisions, not intraday rebalancing. The price DB updates incrementally; sentiment updates as you ingest newsletters.
+- **Sentiment requires coverage.** A sector with no recent newsletter mentions has `sentiment_score = 0`, which is below the BUY threshold. The model is intentionally conservative — no coverage means no BUY.
+- **Split-adjustments.** yfinance returns split-adjusted history. A split that happens today rewrites every prior close. `src/price_store.py` re-checks a 60-day overlap on every incremental update and wipes-and-refetches the full history if it detects > 0.5% drift on any overlapping bar. Do not optimize this away.
+- **Walk-forward validation is a periodic research task, not a live control.** `scripts/run_walk_forward.py` writes its verdict to `data/walk_forward_status.json`, which the Dashboard's Decision Cockpit reads to show a one-line trust badge — but nothing in the live pipeline auto-applies a walk-forward "winner." Parameter changes are still a manual edit to `config/settings.py`, by design. The current defaults (including `chase_weight_fraction = 0.25`) already reflect the last sweep's winners; re-run periodically as more history accumulates.
+- **`signal_snapshots` accumulates over time — it isn't backfilled.** The Rolling edge trend and Conviction calibration expanders, the Information Coefficient table, and (once enough history exists) the performance-feedback caption's preferred data source all read exclusively from persisted `signal_snapshots` rows, written each time the Dashboard renders or `scripts/run_signals.py` runs. On a fresh install these panels are empty or thin; they fill in honestly week by week rather than being retroactively computed from a replay.
+- **The Breakout scanner (🚀) is deliberately independent.** It shares `prices.db` but never touches `build_signals`, `refine_signals`, `target_weights`, or `signal_snapshots` — it exists specifically to cover tickers (crypto, metals, mining) that have no newsletter sentiment and therefore could never pass the sector model's BUY gate.
+- **Theme news is refresh-on-demand, not automatic.** The Expressions tab's news overlay only updates when you click **🔄 Refresh theme news** — it does not refresh on a timer or on every page load, to avoid burning OpenAI calls on every rerun.
+- **Tiger is optional throughout.** Every panel that reads a Tiger snapshot (Dashboard orders-panel sizing, Tiger Drift, the Pre-Trade Checklist's cash-coverage check) degrades gracefully to "no dollar size" or a manual-NLV entry when `TIGER_ID` / `TIGER_ACCOUNT` / `TIGER_PRIVATE_KEY_PATH` aren't configured — the state/vehicle/reasoning columns still work off signals alone.
+- **What this is not.** This is not a live execution engine — humans (or a small Tiger script) place every trade. It's also no longer a single monolithic model: it's the sentiment-gated sector rotation model (the bulk of this doc), a real backtester and walk-forward validator for that model (`src/backtest.py`, `src/walk_forward.py`, the 🧪 Backtest tab), a lightweight portfolio-risk block (`src/risk_metrics.py`, the ⚠️ Portfolio Risk expander), and a second, independent price/volume-only signal system with its own backtester (`src/breakout_signals.py`, `src/breakout_backtest.py`, the 🚀 Breakouts tab).
+
+---
+
+## 5. File map for the curious
+
+| Concern | File |
+|---|---|
+| Parameters & universe | `config/settings.py`, `config/expressions.py`, `config/expanded_universe.py`, `config/themes.py`, `config/whitelist.py` |
+| Price storage (SQLite + yfinance) | `src/price_store.py` |
+| Quant metrics (SMA, RS, momentum) | `src/market_engine.py` |
+| Sector signal (BUY/HOLD/SELL → 7 states) | `src/signals.py` |
+| Historical state replay + forward-perf tracking | `src/signal_history.py` |
+| Signal-quality metrics (information coefficient) | `src/edge_metrics.py` |
+| Regime + breadth snapshot (Decision Cockpit) | `src/regime_snapshot.py` |
+| Regime classification, per-regime stats, drawdown attribution | `src/regime_analysis.py` |
+| Portfolio risk (correlation, concentration, VaR/ES) | `src/risk_metrics.py` |
+| Per-expression self-check | `src/expression_signals.py` |
+| Sub-sector theme taxonomy | `config/themes.py` |
+| Automated theme-news scoring | `src/ticker_news.py` |
+| Sentiment ingest pipeline | `src/gmail_client.py`, `src/content_extractor.py`, `src/nlp_pipeline.py`, `src/db.py` |
+| Sentiment trend reconstruction | `src/trend.py` |
+| Weekly Recap synthesis | `src/weekly_recap.py`, `src/schemas.py` |
+| Chart builders + TA indicators | `src/charts.py`, `src/indicators.py` |
+| Shared UI tokens/CSS | `src/ui_tokens.py` |
+| Tiger broker integration | `src/tiger_client.py` |
+| Walk-forward parameter sweep | `src/walk_forward.py`, `scripts/run_walk_forward.py` |
+| Mechanical-core backtest engine | `src/backtest.py` |
+| Backtest report generation | `src/backtest_report.py`, `scripts/run_backtest_report.py` |
+| Pre-trade readiness checks (shared CLI + Dashboard) | `src/preflight_checks.py`, `scripts/preflight.py` |
+| Consolidation / breakout detection | `src/consolidation.py` |
+| Money-flow (CMF, OBV) | `src/money_flow.py` |
+| Unified breakout signal (🚀 Breakouts tab) | `src/breakout_signals.py` |
+| Breakout signal backtest | `src/breakout_backtest.py` |
+| Dashboard UI | `app.py` |
+
+### Scripts not wired into `app.py` (CLI-only)
+
+| Script | What it does |
+|---|---|
+| `scripts/update_prices.py` | Incremental OHLCV refresh, sector+expression universe only (does **not** cover the expanded crypto/metals universe — use the in-app button for that) |
+| `scripts/extend_history.py` | Wipe-and-repull further back (e.g. to cover 2018/2020 in the backtest) |
+| `scripts/backfill_macro.py`, `scripts/backfill_macro_full.py` | Full-history FRED/yfinance macro series for the research scripts below |
+| `scripts/gmail_oauth_setup.py` | One-time OAuth authorization for the Inbox tab |
+| `scripts/backfill_inbox.py` | Historical newsletter backfill by date range |
+| `scripts/fetch_inbox.py`, `scripts/ingest_newsletter.py` | CLI equivalents of the Inbox / Ingest Newsletter tabs |
+| `scripts/run_signals.py` | Replicates the live signal pipeline outside Streamlit; writes a `signal_snapshots` row |
+| `scripts/refresh_weekly.py` | Simpler print-only weekly signal + macro summary |
+| `scripts/run_regime_analysis.py` | Standalone regime + drawdown-attribution report |
+| `scripts/walk_forward_regime.py`, `scripts/compare_regime_aware.py` | Out-of-sample test of the not-yet-live `BacktestConfig.regime_aware` bull overlay |
+| `scripts/sector_allocator.py`, `scripts/allocator_walk_forward.py` | Alternative continuous cross-sectional allocator (research, not live) |
+| `scripts/tilt_backtest.py`, `scripts/tilt_walk_forward.py` | Alternative "SPY core + momentum tilt that rides winners" strategy (research, not live) |
+
+The last three rows are standing experiments testing whether a different rotation discipline would beat both SPY and the current defensive baseline. Read their module docstrings and walk-forward output before promoting any of them into the live model — none of them are wired into `app.py` today.
