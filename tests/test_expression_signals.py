@@ -16,6 +16,7 @@ from src.expression_signals import (
     build_theme_sentiment_loader,
     compute_expression_signal,
     compute_expressions_for_sector,
+    expression_strength_score,
     rank_expressions,
 )
 
@@ -284,3 +285,132 @@ def test_compute_expressions_for_sector_passes_theme_overlay():
     assert by["SOXX"].news_flag == "NEWS_CONTRADICTS"  # CONFIRMED + bad news
     # plain proxy carries no theme overlay
     assert by["XLK"].theme_sentiment is None
+
+# ---------------------------------------------------------------------------
+# expression_strength_score (Task 1)
+# ---------------------------------------------------------------------------
+
+def test_strength_score_none_for_every_non_scored_state():
+    expr = _make_expr(beta=1.0)
+
+    body = list(np.full(280, 100.0))
+    tail = list(np.linspace(100, 115, 20))
+    stretched = compute_expression_signal(expr, "NEW_BUY", _series(body + tail),
+                                          _linear(100, 105, 300))
+    assert stretched.state == "STRETCHED"
+    assert expression_strength_score(stretched) is None
+
+    body2 = list(np.linspace(80, 130, 250))
+    tail2 = list(np.linspace(130, 60, 50))
+    broken = compute_expression_signal(expr, "NEW_BUY", _series(body2 + tail2),
+                                       _linear(100, 110, 300))
+    assert broken.state == "BROKEN"
+    assert expression_strength_score(broken) is None
+
+    warm = compute_expression_signal(expr, "NEW_BUY", _linear(100, 110, 100),
+                                     _linear(100, 105, 300))
+    assert warm.state == "WARMING_UP"
+    assert expression_strength_score(warm) is None
+
+    inactive = compute_expression_signal(expr, "HOLD", _linear(80, 110, 300),
+                                         _linear(80, 105, 300))
+    assert inactive.state == "PARENT_INACTIVE"
+    assert expression_strength_score(inactive) is None
+
+    nodata = compute_expression_signal(expr, "NEW_BUY", pd.Series(dtype=float),
+                                       _flat(100, 300))
+    assert nodata.state == "NO_DATA"
+    assert expression_strength_score(nodata) is None
+
+
+def test_strength_score_orders_two_confirmed_by_rs_magnitude():
+    """Same `own` series (-> identical extension/headroom) for both signals;
+    only `parent` differs, isolating rs_vs_parent as the sole variable. The
+    expression beating its parent by more must score higher."""
+    own = _linear(95, 105, 300)
+    parent_weak = _flat(95.0, 300)         # own clearly outpaces a flat parent
+    parent_close = _linear(95, 104, 300)   # own barely outpaces this one
+
+    sig_big_rs = compute_expression_signal(_make_expr("STRONG"), "NEW_BUY",
+                                           own, parent_weak)
+    sig_small_rs = compute_expression_signal(_make_expr("WEAK"), "NEW_BUY",
+                                             own, parent_close)
+    assert sig_big_rs.state == "CONFIRMED"
+    assert sig_small_rs.state == "CONFIRMED"
+    assert sig_big_rs.own_extension_pct == sig_small_rs.own_extension_pct
+    assert sig_big_rs.rs_vs_parent > sig_small_rs.rs_vs_parent > 0
+
+    score_big = expression_strength_score(sig_big_rs)
+    score_small = expression_strength_score(sig_small_rs)
+    assert score_big is not None and score_small is not None
+    assert score_big > score_small
+
+
+def test_strength_score_is_int_in_0_100_range():
+    own = _linear(95, 105, 300)
+    parent = _linear(98, 102, 300)
+    sig = compute_expression_signal(_make_expr(beta=1.0), "NEW_BUY", own, parent)
+    assert sig.state == "CONFIRMED"
+    score = expression_strength_score(sig)
+    assert isinstance(score, int)
+    assert 0 <= score <= 100
+
+
+def test_strength_score_rewards_headroom_below_the_stretched_cutoff():
+    """Two CONFIRMED signals against the same parent -- the one with MORE
+    room before its own beta-scaled STRETCHED cutoff scores higher."""
+    parent = _linear(95, 105, 300)
+    body_roomy = list(np.full(280, 100.0)) + list(np.linspace(100, 103, 20))
+    body_tight = list(np.full(280, 100.0)) + list(np.linspace(100, 111, 20))
+    own_roomy = _series(body_roomy)
+    own_tight = _series(body_tight)
+
+    sig_roomy = compute_expression_signal(_make_expr("ROOMY"), "NEW_BUY",
+                                          own_roomy, parent)
+    sig_tight = compute_expression_signal(_make_expr("TIGHT"), "NEW_BUY",
+                                          own_tight, parent)
+    assert sig_roomy.state == "CONFIRMED"
+    assert sig_tight.state == "CONFIRMED"
+    assert sig_roomy.own_extension_pct < sig_tight.own_extension_pct
+
+    score_roomy = expression_strength_score(sig_roomy)
+    score_tight = expression_strength_score(sig_tight)
+    assert score_roomy > score_tight
+
+
+def test_strength_score_theme_sentiment_nudges_without_dominating():
+    own = _linear(95, 105, 300)
+    parent = own.copy()
+    base = compute_expression_signal(_make_expr("SOXX"), "NEW_BUY", own, parent)
+    assert base.state == "CONFIRMED"
+    good_news = compute_expression_signal(_make_expr("SOXX"), "NEW_BUY", own,
+                                          parent, theme_sentiment=4.0,
+                                          theme_n_obs=3)
+    bad_news = compute_expression_signal(_make_expr("SOXX"), "NEW_BUY", own,
+                                         parent, theme_sentiment=-4.0,
+                                         theme_n_obs=3)
+    s_base = expression_strength_score(base)
+    s_good = expression_strength_score(good_news)
+    s_bad = expression_strength_score(bad_news)
+    assert s_good > s_base > s_bad
+
+
+def test_strength_score_lagging_below_confirmed_when_extension_is_equal():
+    """With `own`'s own trend/extension held IDENTICAL, flipping `parent`
+    from one that beats `own` (-> LAGGING) to one that loses to `own`
+    (-> CONFIRMED) must raise the score."""
+    body = list(np.full(280, 100.0)) + list(np.linspace(100, 104, 20))
+    own_common = _series(body)
+    parent_beats_own = _linear(90, 125, 300)
+    parent_loses_to_own = _linear(98, 99, 300)
+
+    sig_lagging = compute_expression_signal(_make_expr("LAG"), "NEW_BUY",
+                                            own_common, parent_beats_own)
+    sig_confirmed = compute_expression_signal(_make_expr("CONF"), "NEW_BUY",
+                                              own_common, parent_loses_to_own)
+    assert sig_lagging.state == "LAGGING"
+    assert sig_confirmed.state == "CONFIRMED"
+    assert sig_lagging.own_extension_pct == sig_confirmed.own_extension_pct
+
+    assert (expression_strength_score(sig_lagging)
+            < expression_strength_score(sig_confirmed))

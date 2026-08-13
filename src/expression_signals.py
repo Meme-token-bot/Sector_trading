@@ -369,3 +369,66 @@ def compute_expressions_for_sector(
             e, parent_state, own_close, parent_close,
             theme_sentiment=ts, theme_n_obs=tn))
     return out
+
+# ---------------------------------------------------------------------------
+# Task 1 — numeric comparability score within an instrument group
+# ---------------------------------------------------------------------------
+
+def expression_strength_score(signal: ExpressionSignal) -> int | None:
+    """0-100 comparability score for CONFIRMED/LAGGING expressions.
+
+    Not a state gate replacement -- the Self-check state has already decided
+    whether the vehicle is actionable. This score only helps rank two
+    same-state vehicles against each other, built purely from fields already
+    on `ExpressionSignal`:
+
+      * rs_vs_parent (0-50 pts)      -- how much the vehicle is beating (or
+        lagging) its parent sector's 3-month return. More positive scores
+        higher; +/-15% RS spread is treated as the "meaningfully different"
+        range and clipped beyond that -- a vehicle beating its parent by 40%
+        isn't twice as investable as one beating it by 20%, it's just
+        clearly ahead.
+      * own_extension_pct's headroom to beta_scaled_cutoff (0-50 pts) -- how
+        much room is left before the vehicle flips to STRETCHED. More
+        headroom (i.e. LESS proximity to the cutoff) scores higher, since a
+        vehicle sitting right at its cutoff is one print away from losing
+        its CONFIRMED/LAGGING standing altogether.
+      * theme_sentiment (+/-10 pts, optional) -- nudges the score when a
+        theme-news read exists. Missing theme data is neutral, never a
+        penalty.
+
+    Returns None for STRETCHED / BROKEN / WARMING_UP / PARENT_INACTIVE /
+    NO_DATA -- for those states the state itself is the answer ("don't buy
+    this"), and a numeric score would imply a false precision the inputs
+    don't support (e.g. BROKEN has no rs-vs-headroom trade-off to rank --
+    it's just a no).
+
+    Does NOT touch `_STATE_RANK` or `rank_expressions`'s primary sort order
+    -- state still sorts first; this is a same-state secondary tiebreaker
+    and a display value only.
+    """
+    if signal.state not in ("CONFIRMED", "LAGGING"):
+        return None
+
+    # --- RS component ----------------------------------------------------
+    rs = signal.rs_vs_parent if signal.rs_vs_parent is not None else 0.0
+    rs_clamped = max(-0.15, min(0.15, rs))
+    rs_component = (rs_clamped / 0.15) * 25.0 + 25.0   # [-0.15,0.15] -> [0,50]
+
+    # --- Headroom-to-cutoff component ------------------------------------
+    ext = signal.own_extension_pct
+    cutoff = signal.beta_scaled_cutoff
+    if ext is not None and cutoff is not None and cutoff > 0:
+        proximity = max(0.0, min(1.0, ext / cutoff))
+        headroom_component = (1.0 - proximity) * 50.0
+    else:
+        headroom_component = 25.0  # unknown -- neutral midpoint, not a penalty
+
+    score = rs_component + headroom_component
+
+    # --- Theme-news nudge -------------------------------------------------
+    if signal.theme_sentiment is not None:
+        nudge = max(-5.0, min(5.0, signal.theme_sentiment)) / 5.0 * 10.0
+        score += nudge
+
+    return int(round(max(0.0, min(100.0, score))))

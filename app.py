@@ -20,6 +20,7 @@ from src.market_engine import (
     gold_oil_ratio, vix_level, yield_curve_spread,
 )
 from src.nlp_pipeline import fetch_and_ingest, ingest
+from src.opportunity_board import build_opportunity_board
 from src.price_store import load_ohlcv, load_ohlcv_multi, update_all
 from src.signal_history import build_signal_history
 from src.signals import build_signals, refine_signals, target_weights
@@ -255,6 +256,42 @@ def _cached_top_vehicle(sector: str, parent_state: str,
     return sector
 
 
+@st.cache_data(ttl=10 * 60, show_spinner=False)
+def _cached_top_vehicle_score(sector: str, parent_state: str,
+                              as_of_iso: str) -> int | None:
+    """Task-1 `expression_strength_score` (0-100) of the SAME vehicle
+    `_cached_top_vehicle` surfaces for this sector -- i.e. the score of the
+    actual ticker a NEW_BUY/partial-CHASE row would tell you to buy.
+
+    Deliberately a standalone cache entry, mirroring `_cached_top_vehicle`'s
+    own computation, rather than reading `_cached_expression_signals` --
+    that function is defined later in this file (Expressions-tab section)
+    and isn't available yet when the Dashboard tab's opportunity board
+    renders earlier in the same script run. Returns None if the sector has
+    no CONFIRMED vehicle (the score is only defined for CONFIRMED/LAGGING
+    states -- see src/expression_signals.py).
+    """
+    warmup_start = date.fromisoformat(as_of_iso) - timedelta(days=300)
+
+    def _loader(ticker: str) -> pd.Series:
+        df = load_ohlcv(ticker, "1d", start=warmup_start)
+        if df.empty:
+            return pd.Series(dtype=float)
+        return df["close"]
+
+    try:
+        from src.expression_signals import expression_strength_score, rank_expressions
+        sigs = rank_expressions(compute_expressions_for_sector(
+            sector, parent_state, _loader,
+            theme_sentiment_loader=_theme_loader(as_of_iso)))
+    except Exception:
+        return None
+    for s in sigs:
+        if s.state == "CONFIRMED":
+            return expression_strength_score(s)
+    return None
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def _cached_signal_performance(as_of_iso: str) -> dict:
     """Backtest aggregates for the trailing 12-week BUY snapshots."""
@@ -313,6 +350,66 @@ def _cached_risk_snapshot(as_of_iso: str) -> dict:
     return {"n_names": len(names), "avg_corr": average_pairwise_correlation(corr),
            "eff_n_naive": conc["effective_n_naive"], "eff_n_corr": conc["effective_n_corr_adjusted"],
            "var": var_es["var"], "es": var_es["es"], "corr_matrix": corr}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_breakout_universe(as_of_iso: str) -> list[dict]:
+    """Breakout/money-flow signal for every ticker in the expanded universe.
+    Returns plain dicts (not the dataclass) for the same reason
+    _cached_expression_signals does -- streamlit's cache and frozen
+    dataclasses with nested dataclass fields don't always pickle cleanly.
+
+    Relocated here (was previously defined just before the Price Action tab)
+    so the Dashboard tab's opportunity board -- which runs earlier in the
+    script -- can call it too. Behaviour is unchanged; only the definition's
+    position in the file moved.
+    """
+    from config.expanded_universe import EXPANDED_UNIVERSE
+    from src.breakout_signals import compute_breakout_signal
+    from src.price_store import load_ohlcv
+
+    warmup_start = date.fromisoformat(as_of_iso) - timedelta(days=BREAKOUT.atr_baseline_period + 400)
+    out: list[dict] = []
+    from config.expressions import EXPRESSIONS
+    from config.settings import SECTOR_ETFS
+    for sector, name in SECTOR_ETFS.items():
+        plain_tickers = [e for e in EXPRESSIONS.get(sector, []) if e.kind == "plain"]
+        for e in plain_tickers:
+            df = load_ohlcv(e.ticker, "1d", start=warmup_start)
+            sig = compute_breakout_signal(e.ticker, df)
+            out.append({
+                "group": f"{name} ({sector})", "ticker": e.ticker, "label": e.label,
+                "asset_class": "Equity Sector",
+                "execution_ticker": e.execution_ticker or e.ticker,
+                "execution_route": e.execution_route,
+                "is_primary": (e.ticker == sector),
+                "signal": sig.signal, "conviction": sig.conviction,
+                "reasons": sig.signal_reasons, "risk_flags": sig.risk_flags,
+                "price": sig.price, "sma_50": sig.sma_50, "sma_150": sig.sma_150,
+                "sma_50_state": sig.sma_50_slope_state, "sma_150_state": sig.sma_150_slope_state,
+                "money_flow_state": sig.money_flow_state, "cmf": sig.cmf,
+                "consolidation_days": sig.consolidation.consolidation_days,
+                "breakout": sig.consolidation.breakout,
+            })
+    for group, instruments in EXPANDED_UNIVERSE.items():
+        for inst in instruments:
+            df = load_ohlcv(inst.ticker, "1d", start=warmup_start)
+            sig = compute_breakout_signal(inst.ticker, df)
+            out.append({
+                "group": group, "ticker": inst.ticker, "label": inst.label,
+                "asset_class": inst.asset_class,
+                "execution_ticker": inst.execution_ticker or inst.ticker,
+                "execution_route": inst.execution_route,
+                "is_primary": inst.is_primary,
+                "signal": sig.signal, "conviction": sig.conviction,
+                "reasons": sig.signal_reasons, "risk_flags": sig.risk_flags,
+                "price": sig.price, "sma_50": sig.sma_50, "sma_150": sig.sma_150,
+                "sma_50_state": sig.sma_50_slope_state, "sma_150_state": sig.sma_150_slope_state,
+                "money_flow_state": sig.money_flow_state, "cmf": sig.cmf,
+                "consolidation_days": sig.consolidation.consolidation_days,
+                "breakout": sig.consolidation.breakout,
+            })
+    return out
 
 
 def _signal_row_style(row: pd.Series) -> list[str]:
@@ -740,6 +837,97 @@ with tab_dashboard:
                        f"<div style='font-size:13px;'>validated {_wf.get('generated_at','—')} — "
                        f"{_kept}/{_total} defaults kept OOS</div>", unsafe_allow_html=True)
     st.divider()
+
+    # ====== Unified Opportunity Board (Task 2) ============================
+    # One ranked table pulling today's actionable rows from BOTH pipelines.
+    # Never blended into one vocabulary or one score -- every row keeps its
+    # own native state string and an explicit Model label; ranking is
+    # WITHIN each model group only. See src/opportunity_board.py docstring.
+    section("🧭 Opportunity Board — SPDR + Breakout, side by side", level=3)
+    st.caption(
+        "Every actionable row from both pipelines today, labeled by Model. "
+        "Scores are NOT comparable across models — SPDR rows score the top "
+        "vehicle 0–100 (src.expression_signals.expression_strength_score); "
+        "Breakout rows show their own native 0–5 conviction. Rank (#) is "
+        "within each model group only, never a global ranking."
+    )
+    try:
+        _opp_breakout_rows = _cached_breakout_universe(today_iso)
+    except Exception:
+        _opp_breakout_rows = []
+
+    _opp_expression_scores: dict[str, int] = {}
+    for _opp_tkr, _opp_row in signals.iterrows():
+        _opp_state = _opp_row.get("state", "")
+        _opp_is_chase_funded = (
+            _opp_state == "CHASE"
+            and PARAMS.chase_weight_fraction > 0
+            and _opp_tkr in targets.index
+        )
+        if _opp_state == "NEW_BUY" or _opp_is_chase_funded:
+            _opp_score = _cached_top_vehicle_score(_opp_tkr, _opp_state, today_iso)
+            if _opp_score is not None:
+                _opp_expression_scores[_opp_tkr] = _opp_score
+
+    try:
+        opp_board = build_opportunity_board(
+            signals, targets, _opp_breakout_rows,
+            expression_scores=_opp_expression_scores,
+            chase_weight_fraction=PARAMS.chase_weight_fraction,
+        )
+    except Exception as _opp_err:
+        st.warning(f"Opportunity board unavailable: {_opp_err}")
+        opp_board = pd.DataFrame()
+
+    if opp_board.empty:
+        st.caption("No actionable opportunities from either pipeline today.")
+    else:
+        _opp_view = opp_board.copy()
+        _opp_view["target_weight"] = _opp_view["target_weight"].map(
+            lambda w: f"{w:.1%}" if pd.notna(w) else "—"
+        )
+        _opp_view = _opp_view.rename(columns={
+            "model": "Model", "ticker": "Ticker", "name": "Name",
+            "state": "State", "score_display": "Score",
+            "target_weight": "Target Wt", "group_rank": "# in group",
+            "why": "Why",
+        })[["Model", "Ticker", "Name", "State", "Score", "Target Wt",
+            "# in group", "Why"]]
+
+        def _opp_row_style(row: pd.Series) -> list[str]:
+            # Reuses the SAME palette as the SPDR matrix (src.charts.
+            # STATE_COLORS) -- breakout-native BUY / HIGH_CONVICTION_BUY
+            # rows share the NEW_BUY tint (both mean "buy signal fired").
+            # No new colors introduced.
+            state = row.get("State", "")
+            color = _STATE_COLORS.get(state, "")
+            if not color and state in ("BUY", "HIGH_CONVICTION_BUY"):
+                color = _STATE_COLORS.get("NEW_BUY", "")
+            return [f"background-color: {color}; color: #eee" if color else ""
+                    for _ in row]
+
+        st.dataframe(
+            _opp_view.style.apply(_opp_row_style, axis=1),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Model":      st.column_config.TextColumn("Model", width="medium"),
+                "Ticker":     st.column_config.TextColumn("Ticker", width="small"),
+                "Score":      st.column_config.TextColumn(
+                    "Score", width="small",
+                    help=("SPDR rows: 0–100 score of the top vehicle "
+                          "(expression_strength_score). Breakout rows: "
+                          "native 0–5 conviction. The two are NOT the same "
+                          "scale — don't compare the raw numbers across "
+                          "Model groups."),
+                ),
+                "# in group": st.column_config.NumberColumn(
+                    "# in group", width="small",
+                    help="Rank within this row's OWN Model group only.",
+                ),
+                "Why":        st.column_config.TextColumn("Why", width="large"),
+            },
+        )
 
     with st.expander("⚠️ Portfolio Risk — correlation, concentration, VaR", expanded=False):
             _risk = _cached_risk_snapshot(today_iso)
@@ -2295,7 +2483,7 @@ def _cached_expression_signals(
             return pd.Series(dtype=float)
         return df["close"]
 
-    from src.expression_signals import rank_expressions
+    from src.expression_signals import expression_strength_score, rank_expressions
     sigs = rank_expressions(compute_expressions_for_sector(
         sector, parent_state, _loader,
         theme_sentiment_loader=_theme_loader(as_of_iso)))
@@ -2313,63 +2501,11 @@ def _cached_expression_signals(
             "theme_sentiment": s.theme_sentiment,
             "theme_n_obs": s.theme_n_obs,
             "news_flag": s.news_flag,
+            # Task 1 — 0-100 comparability score, CONFIRMED/LAGGING only.
+            "strength_score": expression_strength_score(s),
         }
         for s in sigs
     ]
-
-@st.cache_data(ttl=300, show_spinner=False)
-def _cached_breakout_universe(as_of_iso: str) -> list[dict]:
-    """Breakout/money-flow signal for every ticker in the expanded universe.
-    Returns plain dicts (not the dataclass) for the same reason
-    _cached_expression_signals does -- streamlit's cache and frozen
-    dataclasses with nested dataclass fields don't always pickle cleanly.
-    """
-    from config.expanded_universe import EXPANDED_UNIVERSE
-    from src.breakout_signals import compute_breakout_signal
-    from src.price_store import load_ohlcv
-
-    warmup_start = date.fromisoformat(as_of_iso) - timedelta(days=BREAKOUT.atr_baseline_period + 400)
-    out: list[dict] = []
-    from config.expressions import EXPRESSIONS
-    from config.settings import SECTOR_ETFS
-    for sector, name in SECTOR_ETFS.items():
-        plain_tickers = [e for e in EXPRESSIONS.get(sector, []) if e.kind == "plain"]
-        for e in plain_tickers:
-            df = load_ohlcv(e.ticker, "1d", start=warmup_start)
-            sig = compute_breakout_signal(e.ticker, df)
-            out.append({
-                "group": f"{name} ({sector})", "ticker": e.ticker, "label": e.label,
-                "asset_class": "Equity Sector",
-                "execution_ticker": e.execution_ticker or e.ticker,
-                "execution_route": e.execution_route,
-                "is_primary": (e.ticker == sector),
-                "signal": sig.signal, "conviction": sig.conviction,
-                "reasons": sig.signal_reasons, "risk_flags": sig.risk_flags,
-                "price": sig.price, "sma_50": sig.sma_50, "sma_150": sig.sma_150,
-                "sma_50_state": sig.sma_50_slope_state, "sma_150_state": sig.sma_150_slope_state,
-                "money_flow_state": sig.money_flow_state, "cmf": sig.cmf,
-                "consolidation_days": sig.consolidation.consolidation_days,
-                "breakout": sig.consolidation.breakout,
-            })
-    for group, instruments in EXPANDED_UNIVERSE.items():
-        for inst in instruments:
-            df = load_ohlcv(inst.ticker, "1d", start=warmup_start)
-            sig = compute_breakout_signal(inst.ticker, df)
-            out.append({
-                "group": group, "ticker": inst.ticker, "label": inst.label,
-                "asset_class": inst.asset_class,
-                "execution_ticker": inst.execution_ticker or inst.ticker,
-                "execution_route": inst.execution_route,
-                "is_primary": inst.is_primary,
-                "signal": sig.signal, "conviction": sig.conviction,
-                "reasons": sig.signal_reasons, "risk_flags": sig.risk_flags,
-                "price": sig.price, "sma_50": sig.sma_50, "sma_150": sig.sma_150,
-                "sma_50_state": sig.sma_50_slope_state, "sma_150_state": sig.sma_150_slope_state,
-                "money_flow_state": sig.money_flow_state, "cmf": sig.cmf,
-                "consolidation_days": sig.consolidation.consolidation_days,
-                "breakout": sig.consolidation.breakout,
-            })
-    return out
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _cached_signals_bundle(as_of_iso: str) -> pd.DataFrame:
@@ -2723,6 +2859,7 @@ Shown as `"—"` for tickers with fewer than {PARAMS.sma_window} stored bars
                     "Band": band_str,
                     "Self-check": s["state"],
                     "Self-check reason": s["reason"],
+                    "Strength": s.get("strength_score"),
                 }
                 if has_theme_news:
                     row["Theme news"] = _theme_news_cell(s)
@@ -2731,7 +2868,7 @@ Shown as `"—"` for tickers with fewer than {PARAMS.sma_window} stored bars
                 rows.append(row)
             df_rows = pd.DataFrame(rows)
             column_order = ["Ticker", "Label", "Kind", "β hint", "60d",
-                            "Band", "Self-check", "Self-check reason"]
+                            "Band", "Self-check", "Self-check reason", "Strength"]
             if has_theme_news:
                 column_order.append("Theme news")
             if has_notes:
@@ -2775,6 +2912,18 @@ Shown as `"—"` for tickers with fewer than {PARAMS.sma_window} stored bars
                     ),
                     "Self-check reason": st.column_config.TextColumn(
                         "Self-check reason", width="large",
+                    ),
+                    "Strength": st.column_config.NumberColumn(
+                        "Strength", width="small", format="%d",
+                        help=(
+                            "0-100 comparability score for CONFIRMED/LAGGING "
+                            "rows only (src.expression_signals."
+                            "expression_strength_score) — built from RS vs "
+                            "parent, headroom to the STRETCHED cutoff, and "
+                            "theme sentiment where available. A secondary "
+                            "tiebreaker alongside Self-check, not a "
+                            "replacement for it; blank for every other state."
+                        ),
                     ),
                     "Theme news": st.column_config.TextColumn(
                         "Theme news", width="medium",
