@@ -39,12 +39,16 @@ init_db()
 
 def _full_price_universe() -> list[str]:
     """Tickers seeded into the OHLCV cache: signals + benchmark + all
-    expression tickers + the expanded (metals/crypto) universe, deduped
-    while preserving signal-first order."""
+    expression tickers + the expanded (metals/crypto) universe + the
+    Industry Rotation Grid's industry proxies + the Fund Screener's
+    candidate tickers, deduped while preserving signal-first order."""
     from config.expressions import all_expression_tickers
     from config.expanded_universe import all_expanded_tickers
+    from config.industries import all_industry_tickers
+    from config.fund_screener_themes import all_screener_tickers
     return list(dict.fromkeys([
         *SECTOR_ETFS, BENCHMARK, *all_expression_tickers(), *all_expanded_tickers(),
+        *all_industry_tickers(), *all_screener_tickers(),
     ]))
 
 
@@ -768,10 +772,12 @@ render_header(
 )
 
 (tab_dashboard, tab_recap, tab_macro, tab_price, tab_expressions, tab_trend,
- tab_inbox, tab_ingest, tab_history, tab_backtest, tab_breakouts) = st.tabs(
+ tab_inbox, tab_ingest, tab_history, tab_backtest, tab_breakouts,
+ tab_industry, tab_screener) = st.tabs(
     ["📈 Dashboard", "📰 Weekly Recap", "🌐 Macro", "📉 Price Action",
      "🎯 Expressions", "✨ Trend", "📧 Inbox", "📥 Ingest Newsletter",
-     "🗂 History", "🧪 Backtest", "🚀 Breakouts"]
+     "🗂 History", "🧪 Backtest", "🚀 Breakouts",
+     "🏭 Industry Rotation", "🔍 Fund Screener"]
 )
 
 with tab_dashboard:

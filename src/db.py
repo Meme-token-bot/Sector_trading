@@ -97,8 +97,33 @@ CREATE TABLE IF NOT EXISTS signal_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_snap_ticker ON signal_snapshots(ticker, as_of);
 CREATE INDEX IF NOT EXISTS idx_snap_state  ON signal_snapshots(state, as_of);
-"""
 
+-- Industry Rotation Grid snapshots. One row per (as_of, industry). Written
+-- by the 🏭 Industry Rotation tab every render (idempotent — same day
+-- overwrites), read back to build the day-over-day Rotation Flow diff.
+-- Mirrors signal_snapshots' own shape/rationale one section up: a
+-- tamper-resistant record of what the classifier actually emitted, kept
+-- separate from src.industry_rotation (which stays pure / has no DB access
+-- at all — see that module's docstring).
+CREATE TABLE IF NOT EXISTS industry_rotation_snapshots (
+    as_of         DATE    NOT NULL,
+    industry      TEXT    NOT NULL,   -- config.industries.INDUSTRIES key
+    label         TEXT,
+    parent_sector TEXT,
+    ticker        TEXT,
+    state         TEXT    NOT NULL,   -- CLIMBING / BASE / TIRED / DOWNHILL / NOT_ENOUGH_DATA
+    above_ma      INTEGER,            -- 0/1, NULL if NOT_ENOUGH_DATA
+    ma_value      REAL,
+    rs_now        REAL,
+    rs_prior      REAL,
+    rs_slope      REAL,
+    price         REAL,
+    written_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (as_of, industry)
+);
+CREATE INDEX IF NOT EXISTS idx_industry_snap_industry ON industry_rotation_snapshots(industry, as_of);
+CREATE INDEX IF NOT EXISTS idx_industry_snap_state    ON industry_rotation_snapshots(state, as_of);
+"""
 
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add columns introduced after the original schema. Idempotent."""
@@ -497,6 +522,110 @@ def load_signal_snapshots(
         df = pd.read_sql_query(q, c, params=params, parse_dates=["as_of"])
     return df
 
+# ---------------------------------------------------------------------------
+# Industry Rotation Grid snapshots
+# ---------------------------------------------------------------------------
+
+def save_industry_rotation_snapshot(as_of: date, states_df: pd.DataFrame) -> int:
+    """Persist one day's Industry Rotation Grid snapshot.
+
+    `states_df` is the frame from
+    src.industry_rotation.compute_all_industry_states (indexed by industry
+    key; columns label, parent_sector, ticker, state, above_ma, ma_value,
+    rs_now, rs_prior, rs_slope, price). Idempotent on (as_of, industry) —
+    re-running for the same day overwrites, matching signal_snapshots'
+    convention. Returns the row count written (0 for an empty/None frame).
+    """
+    if states_df is None or states_df.empty:
+        return 0
+    init_db()
+    rows: list[dict] = []
+    for industry, row in states_df.iterrows():
+        above_ma = row.get("above_ma")
+        rows.append({
+            "as_of": as_of.isoformat(),
+            "industry": str(industry),
+            "label": row.get("label"),
+            "parent_sector": row.get("parent_sector"),
+            "ticker": row.get("ticker"),
+            "state": str(row.get("state", "")),
+            "above_ma": (None if above_ma is None or pd.isna(above_ma)
+                        else int(bool(above_ma))),
+            "ma_value": _safe_float(row.get("ma_value")),
+            "rs_now": _safe_float(row.get("rs_now")),
+            "rs_prior": _safe_float(row.get("rs_prior")),
+            "rs_slope": _safe_float(row.get("rs_slope")),
+            "price": _safe_float(row.get("price")),
+        })
+    with _conn() as c:
+        c.executemany(
+            """
+            INSERT INTO industry_rotation_snapshots
+              (as_of, industry, label, parent_sector, ticker, state,
+               above_ma, ma_value, rs_now, rs_prior, rs_slope, price, written_at)
+            VALUES
+              (:as_of, :industry, :label, :parent_sector, :ticker, :state,
+               :above_ma, :ma_value, :rs_now, :rs_prior, :rs_slope, :price, CURRENT_TIMESTAMP)
+            ON CONFLICT(as_of, industry) DO UPDATE SET
+              label = excluded.label, parent_sector = excluded.parent_sector,
+              ticker = excluded.ticker, state = excluded.state,
+              above_ma = excluded.above_ma, ma_value = excluded.ma_value,
+              rs_now = excluded.rs_now, rs_prior = excluded.rs_prior,
+              rs_slope = excluded.rs_slope, price = excluded.price,
+              written_at = CURRENT_TIMESTAMP
+            """,
+            rows,
+        )
+    return len(rows)
+
+
+def latest_industry_snapshot_dates(n: int = 2) -> list[str]:
+    """The N most recent distinct as_of dates present, newest first. Empty
+    list if the table has no rows yet (fresh install, or the tab hasn't
+    been opened today)."""
+    init_db()
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT DISTINCT as_of FROM industry_rotation_snapshots "
+            "ORDER BY as_of DESC LIMIT ?", (n,)).fetchall()
+    # `_conn()` opens with detect_types=PARSE_DECLTYPES, so sqlite3 already
+    # auto-converts this DATE-affinity column to a Python `date` on a raw
+    # cursor read (unlike a pandas read, which needs parse_dates=[...]
+    # explicitly). str() normalizes either shape to 'YYYY-MM-DD' — date's
+    # own __str__ IS isoformat — so this is correct regardless of which
+    # form sqlite3 hands back.
+    return [str(r["as_of"]) for r in rows]
+
+
+def load_industry_states_on(as_of_iso: str) -> pd.Series:
+    """Series indexed by industry key -> state, for one as_of date. Empty
+    Series (not an error) if nothing was stored for that date."""
+    init_db()
+    with _conn() as c:
+        df = pd.read_sql_query(
+            "SELECT industry, state FROM industry_rotation_snapshots WHERE as_of = ?",
+            c, params=(as_of_iso,))
+    if df.empty:
+        return pd.Series(dtype=object, name="state")
+    return df.set_index("industry")["state"]
+
+
+def load_industry_rotation_snapshots(since: date | None = None,
+                                     until: date | None = None) -> pd.DataFrame:
+    """Full snapshot history (every column), optionally windowed. Mirrors
+    load_signal_snapshots' shape/signature one section up."""
+    init_db()
+    q = "SELECT * FROM industry_rotation_snapshots WHERE 1=1"
+    params: list = []
+    if since is not None:
+        q += " AND as_of >= ?"
+        params.append(since.isoformat())
+    if until is not None:
+        q += " AND as_of <= ?"
+        params.append(until.isoformat())
+    q += " ORDER BY as_of ASC, industry ASC"
+    with _conn() as c:
+        return pd.read_sql_query(q, c, params=params, parse_dates=["as_of"])
 
 def _safe_float(v) -> float | None:
     try:

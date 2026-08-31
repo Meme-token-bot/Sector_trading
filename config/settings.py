@@ -196,3 +196,38 @@ class MoneyFlowThresholds:
     obv_slope_mild: float = 0.05
 
 MONEY_FLOW = MoneyFlowThresholds()
+
+
+
+# --- Industry Rotation Grid (src/industry_rotation.py) ------------------
+@dataclass(frozen=True)
+class IndustryRotationParams:
+    """Starting heuristic for the Industry Rotation Grid's 4-state
+    classifier (CLIMBING / BASE / TIRED / DOWNHILL) — NOT fitted or
+    validated, recalibrate once forward `industry_rotation_snapshots`
+    history exists to check state transitions against realized forward
+    returns. Mirrors the same caveat DISPERSION_BANDS already carries in
+    src/regime_snapshot.py and MoneyFlowThresholds carries above.
+    """
+    trend_ma_window: int = 50
+    rs_window: int = 63
+    rs_slope_window: int = 20
+    rs_slope_threshold: float = 0.01
+
+INDUSTRY_ROTATION = IndustryRotationParams()
+
+
+# --- Fund Screener (src/fund_screener.py) --------------------------------
+@dataclass(frozen=True)
+class FundScoreParams:
+    """Starting heuristic for the Fund Screener's 0-100 composite score
+    ('Winston Score' framing) — weights are a documented starting point,
+    not fitted or backtested. Recalibrate once forward-return tracking
+    exists for screened picks. Same caveat as IndustryRotationParams above.
+    """
+    return_weight: float = 0.50
+    liquidity_weight: float = 0.30
+    fee_weight: float = 0.20
+    return_lookback_days: int = 252
+
+FUND_SCORE_PARAMS = FundScoreParams()

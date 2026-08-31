@@ -41,6 +41,24 @@ STATE_ACCENTS: dict[str, str] = {
     "SELL":         "#e74c3c",
 }
 
+# Industry Rotation Grid state palette (src/industry_rotation.py) — same
+# dark-tint + brighter-accent convention as STATE_COLORS/STATE_ACCENTS
+# above, deliberately reusing the SAME hex values so the visual language
+# means the same thing across both grids: green=favorable/improving,
+# amber=caution, red=unfavorable/deteriorating, neutral=wait-and-see.
+INDUSTRY_STATE_COLORS: dict[str, str] = {
+    "CLIMBING": "#143d2a",   # matches NEW_BUY
+    "BASE":     "",          # matches HOLD (neutral)
+    "TIRED":    "#3d3a14",   # matches HOLD_IF_LONG (amber)
+    "DOWNHILL": "#4a1818",   # matches SELL
+}
+INDUSTRY_STATE_ACCENTS: dict[str, str] = {
+    "CLIMBING": "#2ecc71",
+    "BASE":     "#888888",
+    "TIRED":    "#f1c40f",
+    "DOWNHILL": "#e74c3c",
+}
+
 # Sector names (kept local so charts.py is independent of config import order
 # for plain plotting use; the lookup will fall back to "" if ticker is unknown).
 _SECTOR_NAMES = {

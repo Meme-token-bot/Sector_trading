@@ -16,6 +16,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from config.expressions import all_expression_tickers  # noqa: E402
+from config.industries import all_industry_tickers  # noqa: E402
+from config.fund_screener_themes import all_screener_tickers  # noqa: E402
 from config.settings import BENCHMARK, SECTOR_ETFS  # noqa: E402
 from src.price_store import update_all  # noqa: E402
 
@@ -23,14 +25,19 @@ from src.price_store import update_all  # noqa: E402
 def main() -> int:
     signal_tickers = list(SECTOR_ETFS.keys()) + [BENCHMARK]
     expression_tickers = all_expression_tickers()
+    industry_tickers = all_industry_tickers()
+    screener_tickers = all_screener_tickers()
     # dict.fromkeys: dedupe while preserving insertion order so the signal
     # universe stays at the front of the list.
-    tickers = list(dict.fromkeys([*SECTOR_ETFS, BENCHMARK, *expression_tickers]))
-    n_extra = len(tickers) - len(signal_tickers)
+    tickers = list(dict.fromkeys([
+        *SECTOR_ETFS, BENCHMARK, *expression_tickers,
+        *industry_tickers, *screener_tickers,
+    ]))
 
     print("=" * 70)
-    print(f"Universe: {len(signal_tickers)} signal + {n_extra} expression = "
-          f"total {len(tickers)} unique")
+    print(f"Universe: {len(signal_tickers)} signal + {len(expression_tickers)} expression "
+          f"+ {len(industry_tickers)} industry + {len(screener_tickers)} fund-screener "
+          f"= total {len(tickers)} unique")
     print(f"Updating OHLCV cache for {len(tickers)} tickers × 2 timeframes")
     print("=" * 70)
 
