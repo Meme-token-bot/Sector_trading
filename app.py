@@ -3656,3 +3656,298 @@ with tab_breakouts:
                     "8 BUY-class names. Signal-validation harness, not a production "
                     "simulator -- see src/breakout_backtest.py docstring."
                 )
+
+# =============================================================================
+# Industry Rotation Grid — 🏭 tab
+# =============================================================================
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_industry_prices(as_of_iso: str) -> pd.DataFrame:
+    from config.industries import all_industry_tickers
+    tickers = all_industry_tickers() + [BENCHMARK]
+    wide = load_ohlcv_multi(tickers, "1d")
+    if wide.empty:
+        return pd.DataFrame()
+    closes = wide.xs("close", axis=1, level=1).sort_index()
+    closes.index = pd.to_datetime(closes.index)
+    return closes
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_industry_states(as_of_iso: str) -> pd.DataFrame:
+    from src.industry_rotation import compute_all_industry_states
+    closes = _cached_industry_prices(as_of_iso)
+    if closes.empty:
+        return pd.DataFrame()
+    return compute_all_industry_states(closes, as_of=date.fromisoformat(as_of_iso))
+
+
+_INDUSTRY_STATE_MINI_CHART_PROXY = {
+    "CLIMBING": "NEW_BUY", "BASE": "HOLD",
+    "TIRED": "HOLD_IF_LONG", "DOWNHILL": "SELL",
+}
+
+
+with tab_industry:
+    section(
+        "🏭 Industry Rotation Grid",
+        help=(
+            "Finer-grained than the 11-sector matrix on the Dashboard tab: "
+            "~60 individual industries (config/industries.py), each "
+            "classified CLIMBING / BASE / TIRED / DOWNHILL from price + "
+            "relative strength alone — no sentiment gate, same reasoning "
+            "the 🚀 Breakouts tab already uses for being un-gated. "
+            "Discovery/context only — never wired into position sizing."
+        ),
+    )
+
+    industry_upd_col, _ = st.columns([1, 4])
+    with industry_upd_col:
+        _render_update_price_data_button(
+            key="industry_update_btn",
+            extra_clears=[_cached_industry_prices, _cached_industry_states],
+        )
+
+    today_iso = date.today().isoformat()
+    industry_states = _cached_industry_states(today_iso)
+
+    if industry_states.empty:
+        st.info(
+            "No industry price data yet. Click **🔄 Update price data** "
+            "above (or on the Price Action / Expressions tab) to populate "
+            "the cache — it now also pulls the Industry Rotation universe."
+        )
+    else:
+        from src.industry_rotation import rotation_flow, rotation_flow_summary, sector_health
+        from src.charts import INDUSTRY_STATE_COLORS
+        from src.db import (
+            latest_industry_snapshot_dates,
+            load_industry_states_on,
+            save_industry_rotation_snapshot,
+        )
+
+        try:
+            save_industry_rotation_snapshot(date.today(), industry_states)
+        except Exception:
+            pass
+
+        health = sector_health(industry_states["state"])
+        h1, h2, h3 = st.columns(3)
+        h1.metric("🟢 Favorable", f"{health['favorable']} / {health['total']}")
+        h2.metric("🔴 Unfavorable", f"{health['unfavorable']} / {health['total']}")
+        h3.metric("⚪ Neutral", f"{health['neutral']} / {health['total']}")
+        st.caption(
+            "Favorable = CLIMBING or BASE (above its own trend MA). "
+            "Unfavorable = TIRED or DOWNHILL (below it). Neutral = "
+            "NOT_ENOUGH_DATA (fewer bars stored than the classifier needs)."
+        )
+
+        section("Rotation Flow", level=3)
+        snap_dates = latest_industry_snapshot_dates(n=2)
+        if len(snap_dates) < 2:
+            st.caption(
+                "Rotation Flow needs two days of snapshots to diff against "
+                "— check back after tomorrow's first render."
+            )
+        else:
+            curr_states = load_industry_states_on(snap_dates[0])
+            prev_states = load_industry_states_on(snap_dates[1])
+            flow = rotation_flow(prev_states, curr_states)
+            st.markdown(f"**{rotation_flow_summary(flow)}**")
+            if not flow.empty:
+                flow_view = flow.reset_index().rename(columns={
+                    "industry": "Industry", "from_state": "From", "to_state": "To",
+                })
+                flow_view["Industry"] = flow_view["Industry"].map(
+                    lambda k: (industry_states.loc[k, "label"]
+                              if k in industry_states.index else k)
+                )
+                st.dataframe(flow_view, use_container_width=True, hide_index=True)
+
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            fav = industry_states[industry_states["state"].isin(["CLIMBING", "BASE"])]
+            with st.expander(f"✅ Favorable industries ({len(fav)})", expanded=False):
+                for _, row in fav.sort_values(["state", "label"]).iterrows():
+                    st.markdown(f"**{row['label']}** ({row['ticker']}) — {row['state']}")
+        with fc2:
+            unfav = industry_states[industry_states["state"].isin(["TIRED", "DOWNHILL"])]
+            with st.expander(f"⚠️ Unfavorable industries ({len(unfav)})", expanded=False):
+                for _, row in unfav.sort_values(["state", "label"]).iterrows():
+                    st.markdown(f"**{row['label']}** ({row['ticker']}) — {row['state']}")
+
+        section("Full grid", level=3)
+        grid = industry_states.reset_index().rename(columns={
+            "industry": "Industry", "label": "Label", "parent_sector": "Sector",
+            "ticker": "Ticker", "state": "State", "rs_now": "RS (3M vs SPY)",
+        })
+        grid["RS (3M vs SPY)"] = grid["RS (3M vs SPY)"].map(
+            lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "—"
+        )
+        grid_show = grid[["Label", "Sector", "Ticker", "State", "RS (3M vs SPY)"]]
+
+        def _industry_row_style(row: pd.Series) -> list[str]:
+            color = INDUSTRY_STATE_COLORS.get(row.get("State", ""), "")
+            return [f"background-color: {color}; color: #eee" if color else ""
+                    for _ in row]
+
+        st.dataframe(
+            grid_show.style.apply(_industry_row_style, axis=1),
+            use_container_width=True, hide_index=True, height=460,
+        )
+
+        section("Inspect one industry", level=3)
+        pick_labels = dict(zip(industry_states.index, industry_states["label"]))
+        picked_key = st.selectbox(
+            "Industry", list(pick_labels.keys()),
+            format_func=lambda k: pick_labels[k], key="industry_grid_pick",
+        )
+        picked_ticker = industry_states.loc[picked_key, "ticker"]
+        picked_state = industry_states.loc[picked_key, "state"]
+        mini_start = date.today() - timedelta(days=260)
+        mini_ohlcv = load_ohlcv(picked_ticker, "1d", start=mini_start)
+        if mini_ohlcv.empty:
+            st.caption(f"No stored price history for {picked_ticker} yet.")
+        else:
+            mini_fig = build_mini_chart(
+                mini_ohlcv, picked_ticker,
+                _INDUSTRY_STATE_MINI_CHART_PROXY.get(picked_state, ""),
+            )
+            st.plotly_chart(mini_fig, use_container_width=False,
+                            config={"displayModeBar": False})
+
+
+# =============================================================================
+# Fund Screener — 🔍 tab
+# =============================================================================
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _cached_screener_prices(as_of_iso: str) -> pd.DataFrame:
+    from config.fund_screener_themes import all_screener_tickers
+    tickers = all_screener_tickers()
+    start = date.fromisoformat(as_of_iso) - timedelta(days=420)
+    wide = load_ohlcv_multi(tickers, "1d", start=start)
+    if wide.empty:
+        return pd.DataFrame()
+    closes = wide.xs("close", axis=1, level=1).sort_index()
+    closes.index = pd.to_datetime(closes.index)
+    return closes
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _cached_fund_metadata(tickers: tuple[str, ...]) -> dict:
+    from src.fund_data import fetch_fund_metadata
+    return fetch_fund_metadata(list(tickers))
+
+
+def _fmt_aum(x: float | None) -> str:
+    if x is None or pd.isna(x):
+        return "—"
+    if x >= 1e9:
+        return f"${x/1e9:.2f}B"
+    return f"${x/1e6:.0f}M"
+
+
+with tab_screener:
+    section(
+        "🔍 Fund Screener",
+        help=(
+            "Theme-based ETF discovery — pick a theme, see every candidate "
+            "fund (config/fund_screener_themes.py) ranked 0-100 by trailing "
+            "return, AUM (liquidity), and expense ratio. Discovery/context "
+            "only — never wired into position sizing or target_weights. "
+            "Funds only, never individual stocks, never leveraged/inverse."
+        ),
+    )
+
+    from config.fund_screener_themes import SCREENER_THEMES
+    from src.fund_screener import score_theme_funds
+
+    scr_upd_col, _ = st.columns([1, 4])
+    with scr_upd_col:
+        _render_update_price_data_button(
+            key="screener_update_btn",
+            extra_clears=[_cached_screener_prices],
+        )
+
+    theme_keys = list(SCREENER_THEMES.keys())
+    picked_theme_key = st.selectbox(
+        "Theme", theme_keys,
+        format_func=lambda k: SCREENER_THEMES[k].label,
+        key="screener_theme_pick",
+    )
+    theme = SCREENER_THEMES[picked_theme_key]
+    if theme.note:
+        st.caption(theme.note)
+
+    today_iso = date.today().isoformat()
+    screener_prices = _cached_screener_prices(today_iso)
+    fund_metadata = _cached_fund_metadata(tuple(theme.tickers))
+
+    table = score_theme_funds(theme, screener_prices, fund_metadata)
+
+    if "screener_watchlist" not in st.session_state:
+        st.session_state.screener_watchlist = set()
+
+    view = table.reset_index()
+    view["expense_ratio"] = view["expense_ratio"].map(
+        lambda x: f"{x*100:.2f}%" if pd.notna(x) else "—"
+    )
+    view["aum"] = view["aum"].map(_fmt_aum)
+    view["return_1y"] = view["return_1y"].map(
+        lambda x: f"{x*100:+.1f}%" if pd.notna(x) else "—"
+    )
+    view["score_display"] = view.apply(lambda r: f"{r['score']} · {r['score_label']}", axis=1)
+    view = view.rename(columns={
+        "ticker": "Symbol", "name": "Name", "score_display": "Score",
+        "expense_ratio": "Expense Ratio", "return_1y": "1Y Return", "aum": "AUM",
+    })[["Symbol", "Name", "Score", "Expense Ratio", "1Y Return", "AUM"]]
+
+    st.dataframe(
+        view, use_container_width=True, hide_index=True,
+        column_config={
+            "Symbol": st.column_config.TextColumn("Symbol", width="small"),
+            "Score": st.column_config.TextColumn(
+                "Score", width="small",
+                help=("0-100 composite: 50% trailing 1y return, 30% AUM "
+                      "(liquidity), 20% expense ratio (lower is better) — "
+                      "each percentile-ranked within THIS theme's candidate "
+                      "set only. Starting heuristic, not fitted — see "
+                      "config.settings.FundScoreParams."),
+            ),
+        },
+    )
+    st.caption(
+        f"{len(theme.tickers)} candidate(s) in this theme. Funds only — "
+        "no leveraged/inverse products, no individual stocks."
+    )
+
+    section("Inspect one fund", level=3)
+    inspect_ticker = st.selectbox("Fund", table.index.tolist(), key="screener_inspect_pick")
+    row = table.loc[inspect_ticker]
+    ic1, ic2, ic3, ic4 = st.columns(4)
+    ic1.metric("Score", f"{row['score']} · {row['score_label']}")
+    ic2.metric("1Y Return",
+               f"{row['return_1y']*100:+.1f}%" if pd.notna(row["return_1y"]) else "—")
+    ic3.metric("Expense Ratio",
+               f"{row['expense_ratio']*100:.2f}%" if pd.notna(row["expense_ratio"]) else "—")
+    ic4.metric("AUM", _fmt_aum(row["aum"]))
+    st.caption(
+        "Score is computed relative to the OTHER candidates in this theme "
+        "only — a 'Fair' score here might be 'Excellent' in a weaker theme."
+    )
+
+    watch_col1, watch_col2 = st.columns([1, 3])
+    with watch_col1:
+        if inspect_ticker in st.session_state.screener_watchlist:
+            if st.button("★ Remove from watchlist", key="screener_unstar"):
+                st.session_state.screener_watchlist.discard(inspect_ticker)
+                st.rerun()
+        else:
+            if st.button("☆ Add to watchlist", key="screener_star"):
+                st.session_state.screener_watchlist.add(inspect_ticker)
+                st.rerun()
+    if st.session_state.screener_watchlist:
+        with watch_col2:
+            st.caption("Watchlist (this session): "
+                      + ", ".join(sorted(st.session_state.screener_watchlist)))
