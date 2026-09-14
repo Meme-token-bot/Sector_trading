@@ -216,6 +216,24 @@ def _log_fetch(ticker: str, timeframe: str, started_at: datetime,
 # Update orchestration
 # ---------------------------------------------------------------------------
 
+def _exclude_forming_bar(common: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Drop the single most-recent shared date from a split-comparison index.
+
+    That bar is frequently still "in progress" at fetch time — a weekly bar
+    for the current, not-yet-closed ISO week (yfinance stamps it with that
+    week's eventual Friday date from the moment the week starts), or, for a
+    24/7 asset like crypto, a daily bar for a day that hasn't finished
+    trading yet. yfinance legitimately revises that one bar's close as more
+    of the period elapses — that revision is NOT a split. Excluding just the
+    newest common date keeps the guard honest: a REAL split still moves
+    every historical close, not just the newest one, so it's still caught
+    via the older, settled bars that remain in the comparison.
+    """
+    if len(common) == 0:
+        return common
+    return common[common < common.max()]
+
+
 def update_ticker(ticker: str, timeframe: str) -> dict:
     """Cold-start or incremental update for one (ticker, timeframe) pair.
 
@@ -242,7 +260,11 @@ def update_ticker(ticker: str, timeframe: str) -> dict:
 
     To guard against this:
       * fetch a 60-day overlap window;
-      * compare each overlapping bar's close to what we already have;
+      * exclude the single most-recent overlapping bar (see
+        `_exclude_forming_bar` — it's often still in progress, and a
+        routine mid-period revision must not be mistaken for a split);
+      * compare each of the remaining, settled overlapping bars' closes
+        to what we already have;
       * if ANY pair differs by more than `SPLIT_TOL` (0.5%), declare a
         split/dividend re-adjustment, WIPE the ticker's full history
         for this timeframe, and re-pull from scratch (~5 years);
@@ -307,9 +329,10 @@ def update_ticker(ticker: str, timeframe: str) -> dict:
         stored_close = stored["close"]
         stored_close.index = pd.to_datetime(stored_close.index).normalize()
         common = new_close.index.intersection(stored_close.index)
-        if len(common):
-            diff = (new_close.loc[common] - stored_close.loc[common]).abs() \
-                   / stored_close.loc[common].replace(0, pd.NA)
+        settled_common = _exclude_forming_bar(common)
+        if len(settled_common):
+            diff = (new_close.loc[settled_common] - stored_close.loc[settled_common]).abs() \
+                   / stored_close.loc[settled_common].replace(0, pd.NA)
             max_diff = float(diff.max(skipna=True)) if not diff.empty else 0.0
             if pd.notna(max_diff) and max_diff > SPLIT_TOL:
                 # Wipe and re-pull from scratch.
