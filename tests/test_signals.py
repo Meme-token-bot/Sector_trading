@@ -432,3 +432,163 @@ def test_promote_chase_false_is_unchanged():
     explicit = target_weights(frame, cash_buffer=0.05, chase_weight_fraction=0.25,
                               promote_chase=False)
     assert default.equals(explicit)
+
+
+# ---------------------------------------------------------------------------
+# State-transition hysteresis (1-week confirmation on entry, 1-week grace on
+# exit). Motivated by a live case: a sector oscillating NEW_BUY <-> REDUCE
+# four times in a month because RS and extension were both hovering right on
+# their thresholds simultaneously. SELL is deliberately untouched by all of
+# this -- a hard SELL gate still fires immediately (see test_signals.py's
+# existing macro-veto tests above, which pass history=None and therefore
+# exercise the pre-hysteresis fallback path unchanged).
+# ---------------------------------------------------------------------------
+
+def test_first_week_buy_with_history_is_watch_not_new_buy():
+    """A fresh raw BUY, with real (if short) history available to check
+    against, must wait one more week before it's a confirmed NEW_BUY."""
+    df = _frame(signal="BUY", rs3=0.05, extension_pct=0.02, above_sma=True)
+    history = pd.DataFrame(
+        [{"XLK": "HOLD"}],
+        index=pd.to_datetime(["2026-05-15"]),
+    )
+    out = refine_signals(df, history=history)
+    assert out.loc["XLK", "state"] == "WATCH"
+    assert "first week" in out.loc["XLK", "state_reason"].lower()
+
+
+def test_second_consecutive_buy_week_confirms_new_buy():
+    """One prior BUY week (n_buy=1) plus today's BUY is the 2nd consecutive
+    week -- now it's a confirmed, actionable NEW_BUY."""
+    df = _frame(signal="BUY", rs3=0.05, extension_pct=0.02, above_sma=True)
+    history = pd.DataFrame(
+        [{"XLK": "BUY"}],
+        index=pd.to_datetime(["2026-05-15"]),
+    )
+    out = refine_signals(df, history=history)
+    assert out.loc["XLK", "state"] == "NEW_BUY"
+
+
+def test_no_history_still_gives_immediate_new_buy():
+    """Documented fallback: with no history to check hysteresis against at
+    all, a fresh raw BUY is still reported as NEW_BUY immediately -- the
+    pre-existing, unconfirmed behaviour is unchanged when there's nothing
+    to compare against."""
+    df = _frame(signal="BUY", rs3=0.05, extension_pct=0.02, above_sma=True)
+    out = refine_signals(df, history=None)
+    assert out.loc["XLK", "state"] == "NEW_BUY"
+
+
+def test_empty_history_frame_also_falls_back_to_immediate_new_buy():
+    df = _frame(signal="BUY", rs3=0.05, extension_pct=0.02, above_sma=True)
+    out = refine_signals(df, history=pd.DataFrame(columns=["XLK"]))
+    assert out.loc["XLK", "state"] == "NEW_BUY"
+
+
+def test_hold_right_after_a_buy_week_gets_one_week_grace():
+    """Was BUY last week (n_buy=1), cooled to raw HOLD this week -- the
+    XLV case: one soft snapshot shouldn't immediately trigger a trim."""
+    df = _frame(signal="HOLD", rs3=-0.01, above_sma=True)
+    history = pd.DataFrame(
+        [{"XLK": "BUY"}],
+        index=pd.to_datetime(["2026-05-15"]),
+    )
+    out = refine_signals(df, history=history)
+    assert out.loc["XLK", "state"] == "HOLD_IF_LONG"
+    assert "cooled" in out.loc["XLK", "state_reason"].lower()
+
+
+def test_hold_after_two_non_buy_weeks_is_reduce():
+    """BUY, then HOLD, then HOLD again today -- the second consecutive
+    non-BUY week confirms the demotion to REDUCE."""
+    df = _frame(signal="HOLD", rs3=-0.01, above_sma=True)
+    history = pd.DataFrame(
+        [{"XLK": "BUY"}, {"XLK": "HOLD"}],
+        index=pd.to_datetime(["2026-05-08", "2026-05-15"]),
+    )
+    out = refine_signals(df, history=history)
+    assert out.loc["XLK", "state"] == "REDUCE"
+
+
+def test_grace_period_hold_if_long_still_gets_target_weight_capital():
+    """The grace-period HOLD_IF_LONG must be treated identically to a
+    genuinely-stale HOLD_IF_LONG by target_weights() -- same "hold if you
+    own it" semantics, same sizing contract; no special-casing needed."""
+    df = _frame(signal="HOLD", rs3=-0.01, above_sma=True)
+    history = pd.DataFrame(
+        [{"XLK": "BUY"}],
+        index=pd.to_datetime(["2026-05-15"]),
+    )
+    out = refine_signals(df, history=history)
+    assert out.loc["XLK", "state"] == "HOLD_IF_LONG"
+    tw = target_weights(out, cash_buffer=0.05)
+    assert "XLK" in tw.index
+
+
+def test_watch_from_first_week_buy_gets_no_target_weight_capital():
+    """Matching WATCH's existing contract: a first-week, unconfirmed BUY
+    must not receive capital, same as the pre-existing macro-override
+    WATCH case."""
+    df = _frame(signal="BUY", rs3=0.05, extension_pct=0.02, above_sma=True)
+    history = pd.DataFrame(
+        [{"XLK": "HOLD"}],
+        index=pd.to_datetime(["2026-05-15"]),
+    )
+    out = refine_signals(df, history=history)
+    assert out.loc["XLK", "state"] == "WATCH"
+    tw = target_weights(out, cash_buffer=0.05)
+    assert "XLK" not in tw.index
+
+
+def test_strong_macro_headwind_still_overrides_a_grace_period_hold_if_long():
+    """Macro can still cut risk through a grace period -- 'macro can cut
+    risk freely but cannot add unconfirmed price risk' applies here too,
+    same as it already does for a genuinely-stale HOLD_IF_LONG."""
+    df = _frame(signal="HOLD", rs3=-0.01, above_sma=True)
+    history = pd.DataFrame(
+        [{"XLK": "BUY"}],
+        index=pd.to_datetime(["2026-05-15"]),
+    )
+    base = refine_signals(df, history=history)
+    assert base.loc["XLK", "state"] == "HOLD_IF_LONG"
+    out = refine_signals(df, history=history, macro_alignment=_strong_head())
+    assert out.loc["XLK", "state"] == "REDUCE"
+
+
+def test_flip_flop_scenario_is_stable_across_a_boundary_hugging_sequence():
+    """Reproduces the live XLI pattern end to end: raw signal oscillating
+    BUY/HOLD/BUY/HOLD/BUY across five consecutive weeks, with real history
+    available throughout (seeded with one prior week so hysteresis applies
+    from the first observed week -- an entirely empty history correctly
+    falls back to the unconfirmed behaviour per the documented contract,
+    covered separately by test_no_history_still_gives_immediate_new_buy).
+
+    Before this fix every BUY week reported NEW_BUY and every HOLD week
+    reported REDUCE -- four hard flips in four transitions. After the fix,
+    only a SUSTAINED (2-consecutive-week) read is ever reported as NEW_BUY
+    or REDUCE; single-week wobbles show as WATCH or HOLD_IF_LONG instead.
+    """
+    sequence = ["BUY", "HOLD", "BUY", "HOLD", "BUY"]
+    dates = pd.to_datetime(["2026-07-27", "2026-08-03", "2026-08-06",
+                            "2026-08-13", "2026-08-21"])
+    observed_states = []
+    # Seed one prior (pre-sequence) week so has_history=True throughout.
+    history = pd.DataFrame([{"XLK": "HOLD"}], index=pd.to_datetime(["2026-07-20"]))
+    for sig, d in zip(sequence, dates):
+        df = _frame(signal=sig, rs3=(0.01 if sig == "BUY" else -0.01),
+                    extension_pct=0.06, above_sma=True)
+        out = refine_signals(df, history=history)
+        observed_states.append(out.loc["XLK", "state"])
+        history = pd.concat([history, pd.DataFrame([{"XLK": sig}], index=[d])])
+
+    # None of the hard, capital-moving labels (NEW_BUY / REDUCE) appear
+    # until a read has actually been sustained for 2 consecutive weeks.
+    assert observed_states[0] == "WATCH"          # week 1 BUY: unconfirmed
+    assert observed_states[1] == "HOLD_IF_LONG"    # week 2 HOLD: one week's grace
+    assert observed_states[2] == "WATCH"           # week 3 BUY: unconfirmed again
+    assert observed_states[3] == "HOLD_IF_LONG"    # week 4 HOLD: grace again
+    assert observed_states[4] == "WATCH"           # week 5 BUY: unconfirmed again
+    # Zero hard flips into a capital-moving state across the whole noisy
+    # run -- this is exactly the flip-flop the fix targets.
+    assert "NEW_BUY" not in observed_states
+    assert "REDUCE" not in observed_states

@@ -125,22 +125,39 @@ def refine_signals(signals: pd.DataFrame,
     """Add a state-aware `state` column on top of the raw `signal`.
 
     States:
-      NEW_BUY       — signal=BUY, not extended, fresh (< stale_buy_weeks consecutive BUYs)
-      HOLD_IF_LONG  — signal=BUY but stale (BUY for >= stale_buy_weeks). Hold if owned, don't add.
+      NEW_BUY       — signal=BUY, not extended, fresh, AND this is the 2nd+
+                      consecutive week meeting all three raw gates.
+      HOLD_IF_LONG  — signal=BUY but stale (BUY for >= stale_buy_weeks), OR
+                      signal=HOLD but was BUY last week (one week's grace
+                      before a further demotion). Hold if owned, don't add.
       CHASE         — signal=BUY but extension_pct > cutoff. Don't enter; sector is parabolic.
-      REDUCE        — signal=HOLD now, but was BUY in the recent history window. Trim if owned.
+      WATCH         — signal=BUY, not extended, not stale, but this is only
+                      the FIRST week meeting all three raw gates — one more
+                      consecutive week is required before it counts as an
+                      actionable entry. (WATCH also still covers the
+                      pre-existing macro-override case, below.)
+      REDUCE        — signal=HOLD, was BUY within the recent history window,
+                      AND has now been below the bar for 2+ consecutive
+                      weeks. Trim if owned.
       HOLD          — signal=HOLD with no recent BUY history. Wait-and-see.
-      SELL          — signal=SELL.
+      SELL          — signal=SELL. Never hysteresis-gated — a hard SELL
+                      (price<SMA200, bottom-3 RS, or sentiment floor) fires
+                      immediately; risk-management speed matters more here
+                      than avoiding a single noisy week.
 
-    Pure function. `history` may be None / empty — in that case we can't
-    detect staleness or recent-BUY-now-HOLD, so HOLD stays HOLD and BUY
-    becomes NEW_BUY (gated only by extension).
+    Pure function. `history` may be None / empty — in that case none of the
+    above hysteresis can be evaluated (there's nothing to compare against),
+    so behaviour falls back to the original, unconfirmed rules documented
+    previously: HOLD stays HOLD, BUY becomes NEW_BUY immediately (gated only
+    by extension), and a HOLD after a BUY isn't detectable at all (no REDUCE
+    without history).
     """
     out = signals.copy()
     cutoff = PARAMS.extension_pct_cutoff
     stale_n = PARAMS.stale_buy_weeks
+    has_history = history is not None and not history.empty
 
-    if history is not None and not history.empty:
+    if has_history:
         from src.signal_history import consecutive_buy_weeks
         weeks = consecutive_buy_weeks(history).reindex(out.index).fillna(0).astype(int)
         # Was the sector BUY at any point in the recent history window?
@@ -177,22 +194,53 @@ def refine_signals(signals: pd.DataFrame,
                     f"BUY for {n_buy} consecutive weeks (cutoff {stale_n}) "
                     f"— hold if you own it, do not add fresh"
                 )
+            elif has_history and n_buy == 0:
+                # First week clearing all three raw gates. A signal sitting
+                # right at the RS or extension boundary can clear it for a
+                # single snapshot and drop back the next -- NEW_BUY is the
+                # state that actually moves money (see target_weights()),
+                # so require one more consecutive week before treating it
+                # as a confirmed, actionable entry. WATCH already means
+                # "supported, not yet confirmed, no capital" -- this is
+                # exactly that, just from a different trigger than the
+                # macro-override WATCH case below.
+                states.append("WATCH")
+                state_reasons.append(
+                    f"first week meeting all three gates (RS, SMA200, "
+                    f"sentiment); ext {ext*100:+.1f}% — needs a second "
+                    f"consecutive week before it's a confirmed entry"
+                )
             else:
                 states.append("NEW_BUY")
                 state_reasons.append(
-                    f"fresh BUY (week {n_buy + 1}); ext {ext*100:+.1f}% "
-                    f"vs SMA200 (cutoff {cutoff*100:.0f}%)"
+                    f"fresh BUY, confirmed for 2+ consecutive weeks "
+                    f"(week {n_buy + 1}); ext {ext*100:+.1f}% vs SMA200 "
+                    f"(cutoff {cutoff*100:.0f}%)"
                 )
             continue
 
         # signal == HOLD
         if bool(ever_buy.get(tkr, False)):
-            states.append("REDUCE")
-            state_reasons.append(
-                "was BUY in the last "
-                f"{len(history) if history is not None else 0} weeks but no longer "
-                f"qualifies — trim if owned"
-            )
+            if n_buy >= 1:
+                # Was BUY last week; this is only the FIRST week it's
+                # cooled to HOLD. A single data point -- often just the
+                # sentiment mean dipping under the threshold for one
+                # snapshot -- shouldn't immediately flip a recent BUY into
+                # an active trim. One week's grace, same treatment as any
+                # other mature/stale BUY.
+                states.append("HOLD_IF_LONG")
+                state_reasons.append(
+                    "was BUY last week, cooled to HOLD this week — hold "
+                    "if you own it, reassess next week before trimming"
+                )
+            else:
+                states.append("REDUCE")
+                state_reasons.append(
+                    "was BUY in the last "
+                    f"{len(history) if history is not None else 0} weeks and "
+                    f"has now been below the bar for 2+ consecutive weeks "
+                    f"— trim if owned"
+                )
         else:
             states.append("HOLD")
             state_reasons.append(row["reasons"])
