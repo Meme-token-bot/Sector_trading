@@ -130,7 +130,10 @@ def refine_signals(signals: pd.DataFrame,
       HOLD_IF_LONG  — signal=BUY but stale (BUY for >= stale_buy_weeks), OR
                       signal=HOLD but was BUY last week (one week's grace
                       before a further demotion). Hold if owned, don't add.
-      CHASE         — signal=BUY but extension_pct > cutoff. Don't enter; sector is parabolic.
+      CHASE         — signal=BUY but extension_pct > cutoff (per-sector via
+                      `extension_pct_cutoff_by_sector`, falling back to the
+                      global `extension_pct_cutoff`). Don't enter; sector
+                      is parabolic relative to its OWN typical extension.
       WATCH         — signal=BUY, not extended, not stale, but this is only
                       the FIRST week meeting all three raw gates — one more
                       consecutive week is required before it counts as an
@@ -153,7 +156,6 @@ def refine_signals(signals: pd.DataFrame,
     without history).
     """
     out = signals.copy()
-    cutoff = PARAMS.extension_pct_cutoff
     stale_n = PARAMS.stale_buy_weeks
     has_history = history is not None and not history.empty
 
@@ -175,6 +177,8 @@ def refine_signals(signals: pd.DataFrame,
         sig = row["signal"]
         ext = float(row.get("extension_pct", 0.0) or 0.0)
         n_buy = int(weeks.get(tkr, 0))
+        cutoff = PARAMS.extension_pct_cutoff_by_sector.get(
+            tkr, PARAMS.extension_pct_cutoff)
 
         if sig == "SELL":
             states.append("SELL")

@@ -6,6 +6,8 @@ verified scenarios).
 """
 from __future__ import annotations
 
+import contextlib
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -592,3 +594,61 @@ def test_flip_flop_scenario_is_stable_across_a_boundary_hugging_sequence():
     # run -- this is exactly the flip-flop the fix targets.
     assert "NEW_BUY" not in observed_states
     assert "REDUCE" not in observed_states
+
+
+# ---------------------------------------------------------------------------
+# Per-sector extension_pct_cutoff override
+# ---------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _override_cutoff_by_sector(overrides: dict[str, float]):
+    """Temporarily mutate PARAMS.extension_pct_cutoff_by_sector for one
+    test. Mirrors src.backtest.temporarily_override_params -- PARAMS is a
+    frozen dataclass singleton imported by name across the codebase, so
+    object.__setattr__ is the only way to swap a field for a test without
+    threading a new parameter through refine_signals itself."""
+    original = PARAMS.extension_pct_cutoff_by_sector
+    object.__setattr__(PARAMS, "extension_pct_cutoff_by_sector", overrides)
+    try:
+        yield
+    finally:
+        object.__setattr__(PARAMS, "extension_pct_cutoff_by_sector", original)
+
+
+def test_empty_override_dict_is_the_documented_default():
+    """The whole point: an empty override map must be the live default, so
+    every existing deployment is unaffected until a sector is explicitly
+    added here."""
+    assert PARAMS.extension_pct_cutoff_by_sector == {}
+
+
+def test_per_sector_cutoff_override_widens_the_chase_threshold():
+    """18% extension is CHASE under the global 12% default -- but not once
+    XLK gets its own, wider 25% override."""
+    df = _frame(signal="BUY", rs3=0.05, extension_pct=0.18, above_sma=True)
+    base = refine_signals(df, history=None)
+    assert base.loc["XLK", "state"] == "CHASE"
+    with _override_cutoff_by_sector({"XLK": 0.25}):
+        out = refine_signals(df, history=None)
+    assert out.loc["XLK", "state"] != "CHASE"
+    assert out.loc["XLK", "state"] == "NEW_BUY"
+
+
+def test_per_sector_cutoff_override_can_tighten_too():
+    """The reverse: 8% extension is fine under the 12% global default, but
+    flips to CHASE once XLK gets a tighter 5% override."""
+    df = _frame(signal="BUY", rs3=0.05, extension_pct=0.08, above_sma=True)
+    base = refine_signals(df, history=None)
+    assert base.loc["XLK", "state"] == "NEW_BUY"
+    with _override_cutoff_by_sector({"XLK": 0.05}):
+        out = refine_signals(df, history=None)
+    assert out.loc["XLK", "state"] == "CHASE"
+
+
+def test_unlisted_sector_still_falls_back_to_the_global_cutoff():
+    """Only tickers explicitly present in the override map change -- a
+    sector absent from it keeps using extension_pct_cutoff unchanged."""
+    df = _frame(signal="BUY", rs3=0.05, extension_pct=0.18, above_sma=True)
+    with _override_cutoff_by_sector({"XLY": 0.30}):  # XLK not listed
+        out = refine_signals(df, history=None)
+    assert out.loc["XLK", "state"] == "CHASE"  # unchanged: still the 12% default

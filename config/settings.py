@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -72,6 +72,16 @@ class SignalParams:
     weak_rs_rank_cutoff: int = 3
     # Late-entry guard: if (price-SMA200)/SMA200 > this, BUY -> CHASE
     extension_pct_cutoff: float = 0.12
+    # Per-sector override for the above. A flat 12% cutoff punishes a
+    # persistently-trending sector (XLK sat in CHASE ~35% of weeks in the
+    # live backtest) no differently than a sector that rarely extends at
+    # all (XLU CHASE ~0.5% of weeks) -- the cutoff was never binding there
+    # to begin with. Empty by default: {} means every ticker falls back to
+    # `extension_pct_cutoff` above, so this is a no-op until a sector is
+    # explicitly given its own value here. Starting heuristic once
+    # populated, not fitted -- validate walk-forward before trusting it,
+    # same discipline already applied to chase_weight_fraction.
+    extension_pct_cutoff_by_sector: dict[str, float] = field(default_factory=dict)
     # If a sector has been BUY for >= this many consecutive weekly snapshots,
     # downgrade BUY -> HOLD_IF_LONG (don't add fresh, hold if owned)
     stale_buy_weeks: int = 4
